@@ -173,7 +173,7 @@ class Reporter:
                 'entry_price': round(t['entry_price'], 1),
                 'exit_time': t['exit_time'].strftime('%Y-%m-%d %H:%M') if isinstance(t['exit_time'], pd.Timestamp) else str(t['exit_time']),
                 'exit_price': round(t['exit_price'], 1),
-                'exit_type': '停利 (TP)' if t['exit_type'] == 'TP' else '停損 (SL)',
+                'exit_type': '停利 (TP)' if t['exit_type'] == 'TP' else ('當沖強平 (ISQ)' if t['exit_type'] == 'ISQ' else '停損 (SL)'),
                 'net_points': round(t['net_points'], 1),
                 'pnl': round(t['pnl'], 0),
                 'balance_after': round(t['balance_after'], 0),
@@ -369,6 +369,10 @@ class Reporter:
                     background-color: rgba(244, 63, 94, 0.15);
                     color: var(--accent-rose);
                 }
+                .badge-isq {
+                    background-color: rgba(245, 158, 11, 0.15);
+                    color: var(--accent-amber);
+                }
                 footer {
                     text-align: center;
                     padding: 2rem 0;
@@ -496,7 +500,7 @@ class Reporter:
                                     <td>{{ trade.exit_time }}</td>
                                     <td>{{ trade.exit_price }}</td>
                                     <td>
-                                        <span class="badge {% if trade.exit_type == '停利 (TP)' %}badge-tp{% else %}badge-sl{% endif %}">
+                                        <span class="badge {% if trade.exit_type == '停利 (TP)' %}badge-tp{% elif trade.exit_type == '當沖強平 (ISQ)' %}badge-isq{% else %}badge-sl{% endif %}">
                                             {{ trade.exit_type }}
                                         </span>
                                     </td>

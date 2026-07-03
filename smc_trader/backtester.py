@@ -4,7 +4,8 @@ import datetime
 from typing import List, Dict, Any, Optional, Tuple
 from smc_trader.config import (
     INITIAL_CAPITAL, FUTURES_POINT_VALUE, SLIPPAGE_POINTS,
-    COMMISSION_FEE, DEFAULT_RR, MAX_PENDING_BARS
+    COMMISSION_FEE, DEFAULT_RR, MAX_PENDING_BARS,
+    INTRADAY_EXIT_START, INTRADAY_EXIT_END
 )
 
 class Backtester:
@@ -24,6 +25,12 @@ class Backtester:
         self.commission = commission
         self.default_rr = default_rr
         self.max_pending_bars = max_pending_bars
+        
+        # 解析當沖平倉時間
+        start_h, start_m = map(int, INTRADAY_EXIT_START.split(':'))
+        end_h, end_m = map(int, INTRADAY_EXIT_END.split(':'))
+        self.isq_start = datetime.time(start_h, start_m)
+        self.isq_end = datetime.time(end_h, end_m)
         
         self.reset()
 
@@ -75,6 +82,17 @@ class Backtester:
                 'balance': self.balance
             })
             df.at[i, 'equity'] = current_equity
+
+            # 1.5 檢查當沖時間強平機制 (Intraday Square-off)
+            bar_time = ts.time()
+            if self.isq_start <= bar_time <= self.isq_end:
+                # 若有持倉，強制以收盤價平倉
+                if self.position is not None:
+                    self._force_close_position(bar, i, "ISQ")
+                # 若有掛單，取消掛單
+                if self.pending_order is not None:
+                    self.pending_order = None
+                continue  # 強平期間不建立新委託
 
             # 2. 處理持倉中的停損停利判定
             if self.position is not None:
@@ -292,3 +310,36 @@ class Backtester:
             }
             self.trades.append(trade_record)
             self.position = None
+
+    def _force_close_position(self, bar: Dict[str, Any], current_idx: int, exit_type: str):
+        """強制以收盤價平倉持倉"""
+        pos = self.position
+        if pos is None:
+            return
+            
+        close = bar['close']
+        ts = bar['ts']
+        
+        dir_mult = 1 if pos['direction'] == 'LONG' else -1
+        gross_points = (close - pos['entry_price']) * dir_mult
+        net_points = gross_points - (2.0 * self.slippage)
+        gross_pnl = net_points * self.point_value
+        net_pnl = gross_pnl - (2.0 * self.commission)
+        
+        self.balance += net_pnl
+        
+        trade_record = {
+            'direction': pos['direction'],
+            'entry_time': pos['entry_time'],
+            'entry_price': pos['entry_price'],
+            'exit_time': ts,
+            'exit_price': close,
+            'exit_type': exit_type,
+            'gross_points': gross_points,
+            'net_points': net_points,
+            'pnl': net_pnl,
+            'balance_after': self.balance,
+            'rr_achieved': abs(net_points / (pos['entry_price'] - pos['sl'])) if (pos['entry_price'] - pos['sl']) != 0 else 0
+        }
+        self.trades.append(trade_record)
+        self.position = None
