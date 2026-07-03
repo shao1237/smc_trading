@@ -9,6 +9,7 @@ from smc_trader.data_provider import ShioajiDataProvider, MockDataProvider, resa
 from smc_trader.smc_detector import SMCDetector
 from smc_trader.backtester import Backtester
 from smc_trader.reporter import Reporter
+from smc_trader.stats_validator import StatsValidator
 
 def main():
     parser = argparse.ArgumentParser(description="SMC+SNR 台指期自動化交易回測系統")
@@ -24,6 +25,10 @@ def main():
                         help="Shioaji API Key")
     parser.add_argument("--secret-key", type=str, default=SHIOAJI_SECRET_KEY,
                         help="Shioaji Secret Key")
+    parser.add_argument("--validate", action="store_true",
+                        help="是否啟用蒙地卡羅/Bootstrap/WFA 等高階統計檢定")
+    parser.add_argument("--num-tests", type=int, default=10,
+                        help="Bonferroni 校正所測試的參數組數量")
     
     args = parser.parse_args()
 
@@ -99,12 +104,49 @@ def main():
 
     # 5. 生成報告與圖表
     print("正在計算策略指標與生成回測報告...")
-    # 報告檔案存放於根目錄或 data_cache
     output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "reports")
     os.makedirs(output_dir, exist_ok=True)
     
     reporter = Reporter(output_dir=output_dir)
     
+    # 5.1 執行高階統計檢定 (若啟用了 --validate)
+    val_metrics = None
+    val_img_path = None
+    if args.validate:
+        print("正在執行高階統計檢定 (MCPT, Bootstrap, WFA, Bonferroni)...")
+        validator = StatsValidator()
+        
+        # A. Bootstrap CI
+        boot_res = validator.run_bootstrap_ci(trades, num_bootstrap=2000)
+        
+        # B. MCPT
+        mcpt_res = validator.run_mcpt(trades, num_permutations=1000)
+        
+        # C. Bonferroni 校正
+        bonf_res = validator.run_bonferroni(mcpt_res['p_value'], num_tests=args.num_tests)
+        
+        # D. Walk-Forward Analysis
+        wfa_res = validator.run_walk_forward(df_1m_processed, df_5m_processed, num_folds=3)
+        
+        val_metrics = {
+            'mcpt': mcpt_res,
+            'bootstrap': boot_res,
+            'bonferroni': bonf_res,
+            'wfa': wfa_res
+        }
+        
+        # 繪製統計檢定直方圖
+        val_img_path = reporter.plot_validation_charts(
+            mcpt_dist=mcpt_res['distribution'],
+            real_profit=mcpt_res['real_profit'],
+            p_value=mcpt_res['p_value'],
+            bootstrap_dist=boot_res['distribution'],
+            low_ci=boot_res['low_ci'],
+            high_ci=boot_res['high_ci'],
+            filename="validation_charts.png"
+        )
+        print("高階統計檢定完成，並已生成檢定分佈圖表。")
+
     # 計算指標
     metrics = reporter.calculate_metrics(trades, backtester.equity_curve, INITIAL_CAPITAL)
     
@@ -112,7 +154,14 @@ def main():
     equity_img_path = reporter.plot_equity_curve(backtester.equity_curve, filename="equity_curve.png")
     
     # 生成 HTML
-    report_html_path = reporter.generate_html_report(metrics, trades, equity_img_path, filename="report.html")
+    report_html_path = reporter.generate_html_report(
+        metrics, 
+        trades, 
+        equity_img_path, 
+        validation_metrics=val_metrics, 
+        validation_filepath=val_img_path, 
+        filename="report.html"
+    )
 
     # 6. 輸出摘要至終端機
     print("=" * 60)
@@ -126,8 +175,18 @@ def main():
     print(f"平均盈虧比 (R:R) : {metrics['avg_rr']}")
     print(f"獲利因子 (Profit Factor) : {metrics['profit_factor']}")
     print(f"最大回撤 (MDD)          : {metrics['max_drawdown_pct']}%")
+    if val_metrics:
+        print("-" * 60)
+        print("                     高階統計驗證結果                     ")
+        print("-" * 60)
+        print(f"MCPT p-value       : {val_metrics['mcpt']['p_value']} (通過: {val_metrics['mcpt']['passed']})")
+        print(f"Bonferroni 校正門檻 : {val_metrics['bonferroni']['adjusted_alpha']} (通過: {val_metrics['bonferroni']['passed']})")
+        print(f"Walk-Forward (WFE) : {val_metrics['wfa']['wfe']}% (通過: {val_metrics['wfa']['passed']})")
+        print(f"Bootstrap 95% CI   : [{val_metrics['bootstrap']['low_ci']}, {val_metrics['bootstrap']['high_ci']}] (通過: {val_metrics['bootstrap']['passed']})")
     print("=" * 60)
     print(f"資產曲線圖已儲存至: [equity_curve.png](file:///{equity_img_path.replace(os.sep, '/')})")
+    if val_img_path:
+        print(f"高階統計圖已儲存至: [validation_charts.png](file:///{val_img_path.replace(os.sep, '/')})")
     print(f"HTML 互動報告已生成至: [report.html](file:///{report_html_path.replace(os.sep, '/')})")
     print("=" * 60)
 
