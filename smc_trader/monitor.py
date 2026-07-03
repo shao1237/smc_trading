@@ -1,0 +1,298 @@
+import os
+import sys
+import time
+import datetime
+import numpy as np
+import pandas as pd
+import shioaji as sj
+from typing import List, Dict, Any, Optional
+from smc_trader.config import (
+    SHIOAJI_API_KEY, SHIOAJI_SECRET_KEY, SHIOAJI_SIMULATION,
+    SWING_WINDOW_5M, SWING_WINDOW_1M, VOLUME_MA_PERIOD, VOLUME_MULT
+)
+from smc_trader.smc_detector import SMCDetector
+from smc_trader.telegram_sender import send_telegram_notification
+
+# ANSI 顏色設定
+C_GREEN = "\033[92m"
+C_RED = "\033[91m"
+C_YELLOW = "\033[93m"
+C_BLUE = "\033[94m"
+C_CYAN = "\033[96m"
+C_BOLD = "\033[1m"
+C_RESET = "\033[0m"
+
+class LiveMonitor:
+    """
+    SMC+SNR 台指期即時監控器。
+    動態接收 (或模擬) 報價，合建成 1M 與 5M K 線，並即時識別 SMC 指標與信號。
+    """
+    def __init__(self, mode: str = "mock", api_key: str = "", secret_key: str = ""):
+        self.mode = mode
+        self.api_key = api_key
+        self.secret_key = secret_key
+        self.detector = SMCDetector(
+            swing_window_5m=SWING_WINDOW_5M,
+            swing_window_1m=SWING_WINDOW_1M,
+            volume_ma_period=VOLUME_MA_PERIOD,
+            volume_mult=VOLUME_MULT
+        )
+        
+        # 歷史 1M K 線數據庫
+        self.history_1m: List[Dict[str, Any]] = []
+        
+        # 當前進行中的 1M K 線
+        self.current_bar_1m: Optional[Dict[str, Any]] = None
+        
+        # 預先載入一部分歷史數據以讓 Swing Points 能夠在初始時就能被計算
+        self._init_history()
+
+    def _init_history(self):
+        """生成或加載初始歷史數據，避免一開始無 Swing 點"""
+        print("正在載入初始歷史數據，建立結構基礎...")
+        np.random.seed(42)
+        base_price = 20000.0
+        now = datetime.datetime.now()
+        
+        # 預先生成 60 根 1M K 線
+        for i in range(60):
+            ts = now - datetime.timedelta(minutes=60 - i)
+            # 隨機生成 K 線
+            o = base_price + np.random.normal(0, 5.0)
+            c = o + np.random.normal(0, 5.0)
+            h = max(o, c) + max(0, np.random.exponential(2.0))
+            l = min(o, c) - max(0, np.random.exponential(2.0))
+            vol = np.random.randint(200, 1000)
+            
+            # 偶爾注入一些波動
+            if i == 45: # 模擬前低
+                l -= 25.0
+            if i == 50: # 模擬前高
+                h += 25.0
+                
+            self.history_1m.append({
+                'ts': ts,
+                'open': round(o, 1),
+                'high': round(h, 1),
+                'low': round(l, 1),
+                'close': round(c, 1),
+                'volume': vol
+            })
+            base_price = c
+        print(f"初始歷史數據載入完畢，共 {len(self.history_1m)} 根 K 線。")
+
+    def run(self):
+        """啟動監控"""
+        if self.mode == "shioaji":
+            try:
+                self._run_shioaji()
+            except Exception as e:
+                print(f"{C_RED}[錯誤] Shioaji 真實監控啟動失敗: {str(e)}{C_RESET}")
+                print(f"{C_YELLOW}[提示] 將自動轉為模擬即時監控模式運行。{C_RESET}")
+                self.mode = "mock"
+                
+        if self.mode == "mock":
+            self._run_mock()
+
+    def _run_shioaji(self):
+        """使用 Shioaji API 真實訂閱台指期監控"""
+        if not self.api_key or not self.secret_key:
+            raise ValueError("Shioaji 登入資訊不足，請設定 api_key 與 secret_key")
+
+        api = sj.Shioaji(simulation=SHIOAJI_SIMULATION)
+        print(f"{C_CYAN}正在登入 Shioaji API 進行實時監控...{C_RESET}")
+        api.login(api_key=self.api_key, secret_key=self.secret_key)
+        print(f"{C_GREEN}登入成功！正在取得台指期近月合約...{C_RESET}")
+        
+        # 尋找當前近月合約
+        futures = api.Contracts.Futures.TXF
+        try:
+            contract = futures["TXFR1"]
+        except KeyError:
+            contract = getattr(futures, "TXFR1", None)
+            
+        if contract is None:
+            raise ValueError("找不到 TXFR1 期貨合約")
+        
+        print(f"{C_GREEN}訂閱商品: {contract.code} - {contract.name}{C_RESET}")
+        print(f"{C_YELLOW}開始接收即時報價，按下 Ctrl+C 結束監控。{C_RESET}")
+        print("=" * 60)
+
+        @api.on_tick_fop_v1()
+        def on_tick(exchange, tick):
+            # 處理即時 Tick
+            # tick 包含：close, volume, datetime 等
+            price = float(tick.close)
+            vol = int(tick.volume)
+            dt = tick.datetime # 格式通常為 datetime 物件
+            
+            self._process_new_tick(price, vol, dt)
+
+        api.quote.subscribe(contract, quote_type=sj.constant.QuoteType.Tick)
+        
+        # 保持執行
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print(f"\n{C_YELLOW}監控已手動終止。{C_RESET}")
+            api.logout()
+
+    def _run_mock(self):
+        """模擬實時監控"""
+        print(f"{C_CYAN}啟動模擬實時監控 (1M K線加速為每 10 秒一根)...{C_RESET}")
+        print(f"{C_YELLOW}開始接收模擬報價，按下 Ctrl+C 結束監控。{C_RESET}")
+        print("=" * 70)
+        
+        last_price = self.history_1m[-1]['close']
+        
+        try:
+            while True:
+                # 模擬 Tick 更新 (每 2 秒一次)
+                dt = datetime.datetime.now()
+                # 隨機產生 Tick 價格
+                tick_change = np.random.normal(0, 2.0)
+                price = round(last_price + tick_change, 1)
+                vol = np.random.randint(10, 50)
+                
+                self._process_new_tick(price, vol, dt)
+                
+                last_price = price
+                time.sleep(2)
+                
+        except KeyboardInterrupt:
+            print(f"\n{C_YELLOW}模擬監控已手動終止。{C_RESET}")
+
+    def _process_new_tick(self, price: float, vol: int, dt: datetime.datetime):
+        """處理傳入的即時報價並合建成 K 線"""
+        # 模擬模式下，1M K 線加速為 10 秒
+        time_step = 10 if self.mode == "mock" else 60
+        
+        # 判定是否需要換新的一根 K 線
+        if self.current_bar_1m is None:
+            self.current_bar_1m = {
+                'ts': dt,
+                'open': price,
+                'high': price,
+                'low': price,
+                'close': price,
+                'volume': vol
+            }
+        else:
+            cb = self.current_bar_1m
+            # 檢查時間差是否達到一個 K 線週期
+            time_diff = (dt - cb['ts']).total_seconds()
+            if time_diff < time_step:
+                # 更新當前 K 線
+                cb['high'] = max(cb['high'], price)
+                cb['low'] = min(cb['low'], price)
+                cb['close'] = price
+                cb['volume'] += vol
+            else:
+                # 將當前 K 線歸檔到歷史中
+                self.history_1m.append(cb)
+                if len(self.history_1m) > 200: # 限制長度避免記憶體過大
+                    self.history_1m.pop(0)
+                
+                # 計算最新 SMC 指標並在螢幕上更新！
+                self._analyze_and_print_state()
+                
+                # 開啟新的一根 K 線
+                self.current_bar_1m = {
+                    'ts': dt,
+                    'open': price,
+                    'high': price,
+                    'low': price,
+                    'close': price,
+                    'volume': vol
+                }
+
+    def _analyze_and_print_state(self):
+        """對當前歷史 K 線數據進行 SMC 特徵辨識，並精美輸出"""
+        df_1m = pd.DataFrame(self.history_1m)
+        
+        # 合成 5M
+        # 為了能在短歷史中運行，resample 到 5M
+        # 模擬模式下 5M K 線為 5 根 1M K 線 (50秒)
+        rule = '50s' if self.mode == "mock" else '5min'
+        df_5m = df_1m.resample(rule, on='ts').agg({
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last',
+            'volume': 'sum'
+        }).dropna().reset_index()
+
+        # 特徵檢測
+        df_5m_proc = self.detector.process_5m_structure(df_5m)
+        df_1m_proc = self.detector.process_1m_signals(df_1m, df_5m_proc)
+
+        # 取得最後一根 K 線的狀態與指標
+        last_bar = df_1m_proc.iloc[-1]
+        ts_str = last_bar['ts'].strftime('%H:%M:%S')
+        price = last_bar['close']
+        trend_5m = last_bar['trend_5m']
+        
+        # 檢測是否有特殊信號
+        has_signal = False
+        signal_tg_name = ""
+        signal_str = f"{C_BOLD}無特殊信號{C_RESET}"
+        
+        if last_bar['sweep_low']:
+            signal_str = f"{C_GREEN}{C_BOLD}★ [流動性掠奪] Sweep Low 形成！(買方防守){C_RESET}"
+            signal_tg_name = "★ [流動性掠奪] Sweep Low 形成！"
+            has_signal = True
+        elif last_bar['sweep_high']:
+            signal_str = f"{C_RED}{C_BOLD}★ [流動性掠奪] Sweep High 形成！(賣方防守){C_RESET}"
+            signal_tg_name = "★ [流動性掠奪] Sweep High 形成！"
+            has_signal = True
+        elif last_bar['mss_bullish']:
+            signal_str = f"{C_GREEN}{C_BOLD}★★ [結構轉換] MSS Bullish 確立！趨勢轉多{C_RESET}"
+            signal_tg_name = "★★ [結構轉換] MSS Bullish 確立！"
+            has_signal = True
+        elif last_bar['mss_bearish']:
+            signal_str = f"{C_RED}{C_BOLD}★★ [結構轉換] MSS Bearish 確立！趨勢轉空{C_RESET}"
+            signal_tg_name = "★★ [結構轉換] MSS Bearish 確立！"
+            has_signal = True
+        elif last_bar['cisd_bullish']:
+            signal_str = f"{C_GREEN}{C_BOLD}★★★ [價格交付改變] CISD Bullish 爆量突破對立 OB！{C_RESET}"
+            signal_tg_name = "★★★ [價格交付改變] CISD Bullish 爆量突破！"
+            has_signal = True
+        elif last_bar['cisd_bearish']:
+            signal_str = f"{C_RED}{C_BOLD}★★★ [價格交付改變] CISD Bearish 爆量跌破對立 OB！{C_RESET}"
+            signal_tg_name = "★★★ [價格交付改變] CISD Bearish 爆量跌破！"
+            has_signal = True
+
+        # 取得當前 OB / FVG 區間
+        bull_ob = f"[{last_bar['bullish_ob_low']} - {last_bar['bullish_ob_high']}]" if not np.isnan(last_bar['bullish_ob_low']) else "無"
+        bear_ob = f"[{last_bar['bearish_ob_low']} - {last_bar['bearish_ob_high']}]" if not np.isnan(last_bar['bearish_ob_low']) else "無"
+        
+        bull_fvg = f"[{last_bar['bullish_fvg_low']} - {last_bar['bullish_fvg_high']}]" if not np.isnan(last_bar['bullish_fvg_low']) else "無"
+        bear_fvg = f"[{last_bar['bearish_fvg_low']} - {last_bar['bearish_fvg_high']}]" if not np.isnan(last_bar['bearish_fvg_low']) else "無"
+
+        # 輸出格式
+        trend_color = C_GREEN if trend_5m == "BULLISH" else (C_RED if trend_5m == "BEARISH" else C_RESET)
+        
+        print(f"[{ts_str}] 價格: {C_BOLD}{price}{C_RESET} | 大結構趨勢 (5M): {trend_color}{C_BOLD}{trend_5m}{C_RESET}")
+        print(f"       即時信號 : {signal_str}")
+        print(f"       多頭 OB  : {C_GREEN}{bull_ob}{C_RESET} | 空頭 OB  : {C_RED}{bear_ob}{C_RESET}")
+        print(f"       多頭 FVG : {C_GREEN}{bull_fvg}{C_RESET} | 空頭 FVG : {C_RED}{bear_fvg}{C_RESET}")
+        print("-" * 70)
+
+        # 發送 Telegram 通知
+        if has_signal:
+            dt_str = last_bar['ts'].strftime('%Y-%m-%d %H:%M:%S')
+            tg_text = (
+                f"<b>🔔 SMC 交易訊號觸發通知</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"<b>商品標的</b>：台指期近月 (TXFR1)\n"
+                f"<b>觸發時間</b>：{dt_str}\n"
+                f"<b>最新價格</b>：<code>{price}</code>\n"
+                f"<b>大結構趨勢 (5M)</b>：<b>{trend_5m}</b>\n\n"
+                f"🚨 <b>訊號類型</b>：<b>{signal_tg_name}</b>\n\n"
+                f"🟢 多頭 OB：{bull_ob}\n"
+                f"🔴 空頭 OB：{bear_ob}\n"
+                f"🟢 多頭 FVG：{bull_fvg}\n"
+                f"🔴 空頭 FVG：{bear_fvg}\n"
+            )
+            send_telegram_notification(tg_text)
