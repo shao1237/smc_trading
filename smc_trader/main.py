@@ -29,6 +29,8 @@ def main():
                         help="是否啟用蒙地卡羅/Bootstrap/WFA 等高階統計檢定")
     parser.add_argument("--num-tests", type=int, default=10,
                         help="Bonferroni 校正所測試的參數組數量")
+    parser.add_argument("--vol-mult", type=float, default=VOLUME_MULT,
+                        help="CISD 的成交量爆量判定倍數")
     
     args = parser.parse_args()
 
@@ -83,7 +85,7 @@ def main():
         swing_window_5m=SWING_WINDOW_5M,
         swing_window_1m=SWING_WINDOW_1M,
         volume_ma_period=VOLUME_MA_PERIOD,
-        volume_mult=VOLUME_MULT
+        volume_mult=args.vol_mult
     )
     
     # 3.1 處理 5M 大結構

@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import datetime
 from typing import Dict, List, Tuple, Optional
 
 class SMCDetector:
@@ -279,12 +280,16 @@ class SMCDetector:
                 df_1m.at[i, 'bearish_ob_high'] = last_bearish_ob[1]
 
             # 5. 檢測 CISD (價格交付改變)
+            # 取得當前 K 棒的時間，限制只能在 09:00 到 11:00 之間觸發 CISD
+            bar_time = df_1m['ts'].iloc[i].time()
+            is_cisd_time_valid = (datetime.time(9, 0) <= bar_time <= datetime.time(11, 0))
+
             # Bullish CISD: 實體收盤突破對立 (Bearish) OB 的最高點，且伴隨成交量爆量 (is_vol_spike) 及當前有 FVG 形成
             # 這裡的對立 OB 是 last_bearish_ob
             if last_bearish_ob is not None and closes[i] > last_bearish_ob[1]:
                 # 伴隨爆量與 FVG 形成
                 has_bullish_fvg = (i >= 2 and highs[i-2] < lows[i])
-                if is_vol_spike[i] and has_bullish_fvg:
+                if is_vol_spike[i] and has_bullish_fvg and is_cisd_time_valid:
                     df_1m.at[i, 'cisd_bullish'] = True
                     # 重新定義新的強勢 Bullish OB：為此次引發 CISD 突破的爆量陽線之前的那根陰線
                     ob_low, ob_high = np.nan, np.nan
@@ -301,7 +306,7 @@ class SMCDetector:
             # Bearish CISD: 實體收盤跌破對立 (Bullish) OB 的最低點，且伴隨成交量爆量及當前有 FVG 形成
             if last_bullish_ob is not None and closes[i] < last_bullish_ob[0]:
                 has_bearish_fvg = (i >= 2 and lows[i-2] > highs[i])
-                if is_vol_spike[i] and has_bearish_fvg:
+                if is_vol_spike[i] and has_bearish_fvg and is_cisd_time_valid:
                     df_1m.at[i, 'cisd_bearish'] = True
                     # 重新定義新的強勢 Bearish OB
                     ob_low, ob_high = np.nan, np.nan
