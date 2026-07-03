@@ -33,6 +33,7 @@ SLIPPAGE_POINTS = 2.0        # 每筆交易單邊滑價點數 (來回共 4 點)
 COMMISSION_FEE = 50.0        # 每筆交易單邊手續費 NTD (來回共 100 元)
 DEFAULT_RR = 4.8             # 預設風險報酬比 (Risk-Reward Ratio)
 MAX_PENDING_BARS = 10        # 限價單觸發後，最多等待幾根 K 棒未成交則取消
+MAX_SL_POINTS = 80.0        # 單筆交易最大止損點數上限
 
 # --- 當沖平倉參數 ---
 INTRADAY_EXIT_START = "13:30"  # 強制平倉開始時間

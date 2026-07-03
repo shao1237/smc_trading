@@ -3,7 +3,7 @@ import argparse
 import pandas as pd
 from smc_trader.config import (
     SHIOAJI_API_KEY, SHIOAJI_SECRET_KEY, SHIOAJI_SIMULATION, INITIAL_CAPITAL, DEFAULT_RR,
-    SWING_WINDOW_5M, SWING_WINDOW_1M, VOLUME_MA_PERIOD, VOLUME_MULT
+    SWING_WINDOW_5M, SWING_WINDOW_1M, VOLUME_MA_PERIOD, VOLUME_MULT, MAX_SL_POINTS
 )
 from smc_trader.data_provider import ShioajiDataProvider, MockDataProvider, resample_to_5m
 from smc_trader.smc_detector import SMCDetector
@@ -31,6 +31,8 @@ def main():
                         help="Bonferroni 校正所測試的參數組數量")
     parser.add_argument("--vol-mult", type=float, default=VOLUME_MULT,
                         help="CISD 的成交量爆量判定倍數")
+    parser.add_argument("--max-sl", type=float, default=MAX_SL_POINTS,
+                        help="單筆交易最大虧損止損點數限制")
     
     args = parser.parse_args()
 
@@ -99,7 +101,8 @@ def main():
     print("開始執行逐 K 棒回測交易模擬...")
     backtester = Backtester(
         initial_capital=INITIAL_CAPITAL,
-        default_rr=args.rr
+        default_rr=args.rr,
+        max_sl_points=args.max_sl
     )
     trades, df_backtested = backtester.run(df_1m_processed)
     print(f"回測執行完畢。總成交交易筆數: {len(trades)} 筆")

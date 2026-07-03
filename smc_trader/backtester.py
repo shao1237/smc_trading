@@ -5,7 +5,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from smc_trader.config import (
     INITIAL_CAPITAL, FUTURES_POINT_VALUE, SLIPPAGE_POINTS,
     COMMISSION_FEE, DEFAULT_RR, MAX_PENDING_BARS,
-    INTRADAY_EXIT_START, INTRADAY_EXIT_END
+    INTRADAY_EXIT_START, INTRADAY_EXIT_END, MAX_SL_POINTS
 )
 
 class Backtester:
@@ -18,13 +18,15 @@ class Backtester:
                  slippage: float = SLIPPAGE_POINTS,
                  commission: float = COMMISSION_FEE,
                  default_rr: float = DEFAULT_RR,
-                 max_pending_bars: int = MAX_PENDING_BARS):
+                 max_pending_bars: int = MAX_PENDING_BARS,
+                 max_sl_points: float = MAX_SL_POINTS):
         self.initial_capital = initial_capital
         self.point_value = point_value
         self.slippage = slippage
         self.commission = commission
         self.default_rr = default_rr
         self.max_pending_bars = max_pending_bars
+        self.max_sl_points = max_sl_points
         
         # 解析當沖平倉時間
         start_h, start_m = map(int, INTRADAY_EXIT_START.split(':'))
@@ -142,6 +144,11 @@ class Backtester:
                         sl_price = entry_price - 20.0 # 強制設定最小停損為 20 點
                         sl_points = 20.0
                     
+                    # 限制單筆最大止損點數上限
+                    if sl_points > self.max_sl_points:
+                        sl_price = entry_price - self.max_sl_points
+                        sl_points = self.max_sl_points
+                    
                     # 判定掛單有效性 (當前價格需高於進場限價，表示未來是「回踩」成交)
                     if not np.isnan(entry_price) and close > entry_price:
                         # 計算停利價 (基於 R:R)
@@ -180,6 +187,11 @@ class Backtester:
                     if sl_points <= 5.0:
                         sl_price = entry_price + 20.0
                         sl_points = 20.0
+                    
+                    # 限制單筆最大止損點數上限
+                    if sl_points > self.max_sl_points:
+                        sl_price = entry_price + self.max_sl_points
+                        sl_points = self.max_sl_points
 
                     # 判定掛單有效性 (當前價格需低於進場限價，表示未來是「向上回踩」成交)
                     if not np.isnan(entry_price) and close < entry_price:
