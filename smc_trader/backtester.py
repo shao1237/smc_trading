@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import datetime
 from typing import List, Dict, Any, Optional, Tuple
 from smc_trader.config import (
     INITIAL_CAPITAL, FUTURES_POINT_VALUE, SLIPPAGE_POINTS,
@@ -88,6 +89,11 @@ class Backtester:
                     continue
 
             # 4. 尋找交易訊號
+            # 限制只能在 09:00 - 11:00 之間建立新掛單委託
+            bar_time = ts.time()
+            if not (datetime.time(9, 0) <= bar_time <= datetime.time(11, 0)):
+                continue
+
             # 必須符合大趨勢 (5M BOS)
             if trend_5m == "BULLISH":
                 # 做多條件：MSS Bullish 且 CISD Bullish 同時出現，或在最近 3 根 K 線內出現

@@ -31,7 +31,7 @@ INITIAL_CAPITAL = 1000000.0  # 初始資金：1,000,000 NTD
 FUTURES_POINT_VALUE = 200.0  # 台指期大台每點價值：200 NTD (小台為 50，此處預設為大台)
 SLIPPAGE_POINTS = 2.0        # 每筆交易單邊滑價點數 (來回共 4 點)
 COMMISSION_FEE = 50.0        # 每筆交易單邊手續費 NTD (來回共 100 元)
-DEFAULT_RR = 3.1             # 預設風險報酬比 (Risk-Reward Ratio)
+DEFAULT_RR = 4.8             # 預設風險報酬比 (Risk-Reward Ratio)
 MAX_PENDING_BARS = 10        # 限價單觸發後，最多等待幾根 K 棒未成交則取消
 
 # --- Telegram 設定 ---
