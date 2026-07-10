@@ -78,32 +78,54 @@ class ShioajiDataProvider(DataProvider):
                 
             print(f"成功取得合約: {contract.code} - {contract.name}")
             
-            print(f"開始下載 {contract.code} 歷史 K 線 ({start_date} 至 {end_date})...")
-            kbars = self.api.kbars(
-                contract=contract,
-                start=start_date,
-                end=end_date
-            )
+            # 計算日期區間並切分為多個最大 28 天的區間
+            start_dt = datetime.datetime.strptime(start_date, "%Y-%m-%d")
+            end_dt = datetime.datetime.strptime(end_date, "%Y-%m-%d")
             
-            if not kbars or len(kbars.ts) == 0:
-                raise ValueError("Shioaji API 未回傳任何 K 線數據，請確認日期範圍與開市時間")
-
-            # 轉換為 DataFrame
-            df = pd.DataFrame({**kbars})
-            df['ts'] = pd.to_datetime(df['ts'])
-            df = df.rename(columns={
-                'Open': 'open',
-                'High': 'high',
-                'Low': 'low',
-                'Close': 'close',
-                'Volume': 'volume'
-            })
-            # 只保留需要的欄位
-            df = df[['ts', 'open', 'high', 'low', 'close', 'volume']]
+            sub_intervals = []
+            curr_start = start_dt
+            while curr_start <= end_dt:
+                curr_end = min(curr_start + datetime.timedelta(days=28), end_dt)
+                sub_intervals.append((curr_start.strftime("%Y-%m-%d"), curr_end.strftime("%Y-%m-%d")))
+                curr_start = curr_end + datetime.timedelta(days=1)
+                
+            print(f"時間區間超過限制，已切分為 {len(sub_intervals)} 個子區間下載...")
+            
+            all_dfs = []
+            for idx, (sub_start, sub_end) in enumerate(sub_intervals):
+                print(f"  [{idx+1}/{len(sub_intervals)}] 下載子區間: {sub_start} 至 {sub_end}...")
+                kbars = self.api.kbars(
+                    contract=contract,
+                    start=sub_start,
+                    end=sub_end
+                )
+                if not kbars or len(kbars.ts) == 0:
+                    print(f"  警告：子區間 {sub_start} 至 {sub_end} 未回傳數據，可能為假日或無開市。")
+                    continue
+                
+                # 轉換為 DataFrame
+                df_sub = pd.DataFrame({**kbars})
+                df_sub['ts'] = pd.to_datetime(df_sub['ts'])
+                df_sub = df_sub.rename(columns={
+                    'Open': 'open',
+                    'High': 'high',
+                    'Low': 'low',
+                    'Close': 'close',
+                    'Volume': 'volume'
+                })
+                df_sub = df_sub[['ts', 'open', 'high', 'low', 'close', 'volume']]
+                all_dfs.append(df_sub)
+                
+            if not all_dfs:
+                raise ValueError("Shioaji API 未在任何子區間中回傳 K 線數據")
+                
+            # 合併 DataFrame
+            df = pd.concat(all_dfs, ignore_index=True)
+            df = df.drop_duplicates(subset=['ts']).sort_values('ts').reset_index(drop=True)
             
             # 存入快取
             df.to_csv(cache_file, index=False)
-            print(f"歷史數據已下載並存入快取: {cache_file} (共 {len(df)} 筆)")
+            print(f"歷史數據已下載並合併存入快取: {cache_file} (共 {len(df)} 筆)")
             return df
             
         except Exception as e:
