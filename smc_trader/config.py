@@ -35,6 +35,11 @@ DEFAULT_RR = 4.8             # 預設風險報酬比 (Risk-Reward Ratio)
 MAX_PENDING_BARS = 10        # 限價單觸發後，最多等待幾根 K 棒未成交則取消
 MAX_SL_POINTS = 80.0        # 單筆交易最大止損點數上限
 
+# --- ATR 波動濾網參數 ---
+ATR_PERIOD = 14              # ATR 計算週期
+ATR_MA_PERIOD = 20           # ATR 移動平均週期 (衡量波動均值)
+ATR_MULT = 0.9               # ATR 波動倍數門檻 (ATR14 >= MA * ATR_MULT)
+
 # --- 當沖平倉參數 ---
 INTRADAY_EXIT_START = "13:30"  # 強制平倉開始時間
 INTRADAY_EXIT_END = "13:45"    # 強制平倉截止時間 (日盤結束)

@@ -3,7 +3,7 @@ import argparse
 import pandas as pd
 from smc_trader.config import (
     SHIOAJI_API_KEY, SHIOAJI_SECRET_KEY, SHIOAJI_SIMULATION, INITIAL_CAPITAL, DEFAULT_RR,
-    SWING_WINDOW_5M, SWING_WINDOW_1M, VOLUME_MA_PERIOD, VOLUME_MULT, MAX_SL_POINTS
+    SWING_WINDOW_5M, SWING_WINDOW_1M, VOLUME_MA_PERIOD, VOLUME_MULT, MAX_SL_POINTS, ATR_MULT
 )
 from smc_trader.data_provider import ShioajiDataProvider, MockDataProvider, resample_to_5m
 from smc_trader.smc_detector import SMCDetector
@@ -33,6 +33,8 @@ def main():
                         help="CISD 的成交量爆量判定倍數")
     parser.add_argument("--max-sl", type=float, default=MAX_SL_POINTS,
                         help="單筆交易最大虧損止損點數限制")
+    parser.add_argument("--atr-mult", type=float, default=ATR_MULT,
+                        help="ATR 波動率倍數門檻")
     
     args = parser.parse_args()
 
@@ -87,7 +89,8 @@ def main():
         swing_window_5m=SWING_WINDOW_5M,
         swing_window_1m=SWING_WINDOW_1M,
         volume_ma_period=VOLUME_MA_PERIOD,
-        volume_mult=args.vol_mult
+        volume_mult=args.vol_mult,
+        atr_mult=args.atr_mult
     )
     
     # 3.1 處理 5M 大結構

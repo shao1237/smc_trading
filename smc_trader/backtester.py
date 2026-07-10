@@ -114,6 +114,10 @@ class Backtester:
             if not (datetime.time(9, 0) <= bar_time <= datetime.time(11, 0)):
                 continue
 
+            # 限制波動度合格
+            if 'is_volatile' in bar and not bar['is_volatile']:
+                continue
+
             # 必須符合大趨勢 (5M BOS)
             if trend_5m == "BULLISH":
                 # 做多條件：MSS Bullish 且 CISD Bullish 同時出現，或在最近 3 根 K 線內出現

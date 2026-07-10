@@ -10,11 +10,15 @@ class SMCDetector:
     所有特徵的計算都符合「無未來函數 (No Look-ahead Bias)」的原則。
     """
     def __init__(self, swing_window_5m: int = 5, swing_window_1m: int = 3, 
-                 volume_ma_period: int = 20, volume_mult: float = 1.2):
+                 volume_ma_period: int = 20, volume_mult: float = 1.3,
+                 atr_period: int = 14, atr_ma_period: int = 20, atr_mult: float = 1.0):
         self.swing_window_5m = swing_window_5m
         self.swing_window_1m = swing_window_1m
         self.volume_ma_period = volume_ma_period
         self.volume_mult = volume_mult
+        self.atr_period = atr_period
+        self.atr_ma_period = atr_ma_period
+        self.atr_mult = atr_mult
 
     def detect_swings(self, df: pd.DataFrame, window: int) -> pd.DataFrame:
         """
@@ -147,6 +151,20 @@ class SMCDetector:
         # 3. 計算 Volume MA 用於檢測爆量
         df_1m['vol_ma'] = df_1m['volume'].rolling(window=self.volume_ma_period).mean()
         df_1m['is_vol_spike'] = df_1m['volume'] >= (df_1m['vol_ma'] * self.volume_mult)
+
+        # 3.5 計算 ATR 與波動濾網標記
+        prev_close = df_1m['close'].shift(1)
+        tr1 = df_1m['high'] - df_1m['low']
+        tr2 = (df_1m['high'] - prev_close).abs()
+        tr3 = (df_1m['low'] - prev_close).abs()
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        
+        df_1m['atr'] = tr.rolling(window=self.atr_period).mean()
+        df_1m['atr_ma'] = df_1m['atr'].rolling(window=self.atr_ma_period).mean()
+        
+        df_1m['is_volatile'] = True
+        df_1m.loc[df_1m['atr'].notna() & df_1m['atr_ma'].notna(), 'is_volatile'] = \
+            df_1m['atr'] >= (df_1m['atr_ma'] * self.atr_mult)
 
         # 4. 檢測 1M 結構信號與指標
         df_1m['sweep_low'] = False   # 買方流動性掠奪
