@@ -241,27 +241,27 @@ class LiveMonitor:
         
         if last_bar['sweep_low']:
             signal_str = f"{C_GREEN}{C_BOLD}★ [流動性掠奪] Sweep Low 形成！(買方防守){C_RESET}"
-            signal_tg_name = "★ [流動性掠奪] Sweep Low 形成！"
+            signal_tg_name = "★ [流動性掠奪] Sweep Low 形成 (多頭訊號)！"
             has_signal = True
         elif last_bar['sweep_high']:
             signal_str = f"{C_RED}{C_BOLD}★ [流動性掠奪] Sweep High 形成！(賣方防守){C_RESET}"
-            signal_tg_name = "★ [流動性掠奪] Sweep High 形成！"
+            signal_tg_name = "★ [流動性掠奪] Sweep High 形成 (空頭訊號)！"
             has_signal = True
         elif last_bar['mss_bullish']:
             signal_str = f"{C_GREEN}{C_BOLD}★★ [結構轉換] MSS Bullish 確立！趨勢轉多{C_RESET}"
-            signal_tg_name = "★★ [結構轉換] MSS Bullish 確立！"
+            signal_tg_name = "★★ [結構轉換] MSS Bullish 確立 (多頭訊號)！"
             has_signal = True
         elif last_bar['mss_bearish']:
             signal_str = f"{C_RED}{C_BOLD}★★ [結構轉換] MSS Bearish 確立！趨勢轉空{C_RESET}"
-            signal_tg_name = "★★ [結構轉換] MSS Bearish 確立！"
+            signal_tg_name = "★★ [結構轉換] MSS Bearish 確立 (空頭訊號)！"
             has_signal = True
         elif last_bar['cisd_bullish']:
             signal_str = f"{C_GREEN}{C_BOLD}★★★ [價格交付改變] CISD Bullish 爆量突破對立 OB！{C_RESET}"
-            signal_tg_name = "★★★ [價格交付改變] CISD Bullish 爆量突破！"
+            signal_tg_name = "★★★ [價格交付改變] CISD Bullish 爆量突破 (多頭訊號)！"
             has_signal = True
         elif last_bar['cisd_bearish']:
             signal_str = f"{C_RED}{C_BOLD}★★★ [價格交付改變] CISD Bearish 爆量跌破對立 OB！{C_RESET}"
-            signal_tg_name = "★★★ [價格交付改變] CISD Bearish 爆量跌破！"
+            signal_tg_name = "★★★ [價格交付改變] CISD Bearish 爆量跌破 (空頭訊號)！"
             has_signal = True
 
         # 取得當前 OB / FVG 區間
@@ -362,4 +362,8 @@ class LiveMonitor:
                 f"🔴 空頭 FVG：{bear_fvg}\n\n"
                 f"{trade_advice}\n"
             )
-            send_telegram_notification(tg_text)
+            # 只有在有明確建議掛單（非垃圾/失效訊息）時才發送 Telegram 通知
+            if "💡" in trade_advice:
+                send_telegram_notification(tg_text)
+            else:
+                print(f"       [過濾] 偵測到信號但建議無效，已跳過發送 Telegram 通知。")
