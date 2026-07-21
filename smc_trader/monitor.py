@@ -51,13 +51,42 @@ class LiveMonitor:
     def _init_history(self):
         """生成或加載初始歷史數據，避免一開始無 Swing 點"""
         print("正在載入初始歷史數據，建立結構基礎...")
+        
+        # 1. 嘗試從快取數據加載真實數據 (僅在 shioaji 模式或快取存在時)
+        from smc_trader.config import DATA_CACHE_DIR
+        import glob
+        
+        cache_files = glob.glob(os.path.join(DATA_CACHE_DIR, "shioaji_TXFR1_*.csv"))
+        if cache_files:
+            # 找到最新的快取檔案
+            latest_cache = max(cache_files, key=os.path.getmtime)
+            try:
+                df_cache = pd.read_csv(latest_cache)
+                df_cache['ts'] = pd.to_datetime(df_cache['ts'])
+                # 只取得最後 1000 根 1M K 線作為初始歷史數據
+                df_init = df_cache.tail(1000).copy()
+                for _, r in df_init.iterrows():
+                    self.history_1m.append({
+                        'ts': r['ts'],
+                        'open': float(r['open']),
+                        'high': float(r['high']),
+                        'low': float(r['low']),
+                        'close': float(r['close']),
+                        'volume': int(r['volume'])
+                    })
+                print(f"成功自本地快取檔案 {os.path.basename(latest_cache)} 載入 {len(self.history_1m)} 根真實 1M K 線歷史數據！")
+                return
+            except Exception as e:
+                print(f"嘗試自本地快取加載數據時失敗: {str(e)}，將改採隨機數據生成...")
+        
+        # 2. 隨機生成數據 (Fallback 或者是 mock 模式)
         np.random.seed(42)
         base_price = 20000.0
         now = datetime.datetime.now()
         
-        # 預先生成 60 根 1M K 線
-        for i in range(60):
-            ts = now - datetime.timedelta(minutes=60 - i)
+        # 預先生成 400 根 1M K 線 (約 80 根 5M K 線，足夠建立穩固的 Swing 結構)
+        for i in range(400):
+            ts = now - datetime.timedelta(minutes=400 - i)
             # 隨機生成 K 線
             o = base_price + np.random.normal(0, 5.0)
             c = o + np.random.normal(0, 5.0)
@@ -65,11 +94,11 @@ class LiveMonitor:
             l = min(o, c) - max(0, np.random.exponential(2.0))
             vol = np.random.randint(200, 1000)
             
-            # 偶爾注入一些波動
-            if i == 45: # 模擬前低
-                l -= 25.0
-            if i == 50: # 模擬前高
-                h += 25.0
+            # 偶爾注入一些波動，人為製造 Swing 突破點
+            if i % 80 == 40: 
+                l -= 30.0
+            if i % 80 == 70: 
+                h += 30.0
                 
             self.history_1m.append({
                 'ts': ts,
@@ -80,7 +109,7 @@ class LiveMonitor:
                 'volume': vol
             })
             base_price = c
-        print(f"初始歷史數據載入完畢，共 {len(self.history_1m)} 根 K 線。")
+        print(f"初始模擬歷史數據載入完畢，共 {len(self.history_1m)} 根 K 線。")
 
     def run(self):
         """啟動監控"""
@@ -192,7 +221,7 @@ class LiveMonitor:
             else:
                 # 將當前 K 線歸檔到歷史中
                 self.history_1m.append(cb)
-                if len(self.history_1m) > 200: # 限制長度避免記憶體過大
+                if len(self.history_1m) > 2000: # 擴大長度限制至 2000 根以容納更多 Swing 歷史
                     self.history_1m.pop(0)
                 
                 # 計算最新 SMC 指標並在螢幕上更新！

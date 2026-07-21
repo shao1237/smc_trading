@@ -131,8 +131,16 @@ class SMCDetector:
         # 通常 Resample 得到的 5M 時間戳如 09:00:00，其代表 [09:00, 09:04] 這段期間
         # 該 5M K 線在 09:05:00 之後的 1M K 線才能被正式存取其狀態
         df_5m_lookup = df_5m_processed.copy()
-        # 計算此根 5M K 線收盤的 1M 時間 (5M 標記 + 5分鐘)
-        df_5m_lookup['close_1m_ts'] = df_5m_lookup['ts'] + pd.Timedelta(minutes=5)
+        # 動態計算 5M K 線的實際跨度，自適應 Mock 模式 (50秒) 與真實模式 (5分鐘)
+        if len(df_5m_lookup) >= 2:
+            time_diff = df_5m_lookup['ts'].diff().median()
+            # 若 median 計算出合理值則使用，否則 fallback
+            close_delta = time_diff if not pd.isnull(time_diff) else pd.Timedelta(minutes=5)
+        else:
+            close_delta = pd.Timedelta(minutes=5)
+            
+        # 計算此根 5M K 線收盤的 1M 時間
+        df_5m_lookup['close_1m_ts'] = df_5m_lookup['ts'] + close_delta
         
         # 建立時間對應字典
         trend_dict = dict(zip(df_5m_lookup['close_1m_ts'], df_5m_lookup['trend_5m']))
