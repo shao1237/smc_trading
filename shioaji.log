@@ -56,3 +56,18 @@
 [pid:5372] 2026-07-10T19:03:45.196379Z  INFO shioaji::api::api_v1::contracts::api: Loaded 8914 OPT contracts from cache
 [pid:5372] 2026-07-10T19:03:45.196471Z  INFO _core::api::auth::login: Loaded 53133 contracts after login
 [pid:5372] 2026-07-10T19:04:07.516686Z  INFO shioaji::api::token_pool: Successfully released token slot 1 via temporary runtime
+[pid:17908] 2026-07-14T20:23:24.611432Z  INFO shioaji::api::api_v1::auth::token_login: No cached token available, performing new login
+[pid:17908] 2026-07-14T20:23:24.808647Z  INFO shioaji::api::api_v1::auth::token_login: Stored new token in slot 1
+[pid:17908] 2026-07-14T20:23:24.840067Z  INFO shioaji::api::api_v1::contracts::api: Fetched 127 IND contracts (1 pages)
+[pid:17908] 2026-07-14T20:23:28.994082Z  INFO shioaji::api::api_v1::contracts::api: Fetched 41452 STK contracts (9 pages)
+[pid:17908] 2026-07-14T20:23:29.316291Z  INFO shioaji::api::api_v1::contracts::api: Fetched 2498 FUT contracts (1 pages)
+[pid:17908] 2026-07-14T20:23:30.322319Z  INFO shioaji::api::api_v1::contracts::api: Fetched 8439 OPT contracts (2 pages)
+[pid:17908] 2026-07-14T20:23:30.344556Z  INFO _core::api::auth::login: Loaded 52516 contracts after login
+[pid:17908] 2026-07-14T20:23:31.738105Z  INFO shioaji::api::token_pool: Successfully released token slot 1 via temporary runtime
+[pid:5328] 2026-07-21T17:33:01.809261Z  INFO shioaji::api::api_v1::auth::token_login: No cached token available, performing new login
+[pid:5328] 2026-07-21T17:33:02.003290Z  INFO shioaji::api::api_v1::auth::token_login: Stored new token in slot 2
+[pid:5328] 2026-07-21T17:33:02.039385Z  INFO shioaji::api::api_v1::contracts::api: Fetched 127 IND contracts (1 pages)
+[pid:5328] 2026-07-21T17:33:06.373893Z  INFO shioaji::api::api_v1::contracts::api: Fetched 41742 STK contracts (9 pages)
+[pid:5328] 2026-07-21T17:33:06.771174Z  INFO shioaji::api::api_v1::contracts::api: Fetched 2504 FUT contracts (1 pages)
+[pid:5328] 2026-07-21T17:33:07.838058Z  INFO shioaji::api::api_v1::contracts::api: Fetched 8821 OPT contracts (2 pages)
+[pid:5328] 2026-07-21T17:33:07.869517Z  INFO _core::api::auth::login: Loaded 53194 contracts after login

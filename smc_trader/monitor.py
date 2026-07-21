@@ -8,7 +8,8 @@ import shioaji as sj
 from typing import List, Dict, Any, Optional
 from smc_trader.config import (
     SHIOAJI_API_KEY, SHIOAJI_SECRET_KEY, SHIOAJI_SIMULATION,
-    SWING_WINDOW_5M, SWING_WINDOW_1M, VOLUME_MA_PERIOD, VOLUME_MULT
+    SWING_WINDOW_5M, SWING_WINDOW_1M, VOLUME_MA_PERIOD, VOLUME_MULT,
+    DEFAULT_RR, MAX_SL_POINTS
 )
 from smc_trader.smc_detector import SMCDetector
 from smc_trader.telegram_sender import send_telegram_notification
@@ -282,6 +283,71 @@ class LiveMonitor:
         # 發送 Telegram 通知
         if has_signal:
             dt_str = last_bar['ts'].strftime('%Y-%m-%d %H:%M:%S')
+            
+            # 動態計算交易建議與進場、停損、停利價格
+            is_bullish_signal = "bullish" in signal_tg_name.lower() or "sweep low" in signal_tg_name.lower() or "mss bullish" in signal_tg_name.lower() or "cisd bullish" in signal_tg_name.lower()
+            is_bearish_signal = "bearish" in signal_tg_name.lower() or "sweep high" in signal_tg_name.lower() or "mss bearish" in signal_tg_name.lower() or "cisd bearish" in signal_tg_name.lower()
+            
+            trade_advice = ""
+            if is_bullish_signal:
+                ob_low = last_bar['bullish_ob_low']
+                ob_high = last_bar['bullish_ob_high']
+                fvg_high = last_bar['bullish_fvg_high']
+                
+                entry_price = ob_high if not np.isnan(ob_high) else fvg_high
+                sl_price = ob_low if not np.isnan(ob_low) else (last_bar['confirmed_sl_1m'] if not np.isnan(last_bar['confirmed_sl_1m']) else last_bar['low'] - 15.0)
+                
+                if not np.isnan(entry_price) and not np.isnan(sl_price):
+                    if price <= sl_price:
+                        trade_advice = "❌ <b>建議交易</b>：無 (目前價格已跌破/觸及多頭停損點，多頭 OB 失效！)"
+                    else:
+                        sl_points = entry_price - sl_price
+                        if sl_points <= 5.0:
+                            sl_price = entry_price - 20.0
+                            sl_points = 20.0
+                        elif sl_points > MAX_SL_POINTS:
+                            sl_price = entry_price - MAX_SL_POINTS
+                            sl_points = MAX_SL_POINTS
+                        
+                        tp_price = entry_price + sl_points * DEFAULT_RR
+                        trade_advice = (
+                            f"💡 <b>多頭策略建議掛單</b>：\n"
+                            f"  👉 <b>建議進場價 (限價買)</b>：<code>{entry_price:.1f}</code>\n"
+                            f"  🛑 <b>建議停損價 (SL)</b>：<code>{sl_price:.1f}</code> (風險: {sl_points:.1f} 點)\n"
+                            f"  🎯 <b>建議停利價 (TP)</b>：<code>{tp_price:.1f}</code> (預估利潤: {sl_points*DEFAULT_RR:.1f} 點, R:R={DEFAULT_RR})"
+                        )
+                else:
+                    trade_advice = "❌ <b>建議交易</b>：無 (未檢測到有效的多頭 OB / FVG 區間)"
+            elif is_bearish_signal:
+                ob_low = last_bar['bearish_ob_low']
+                ob_high = last_bar['bearish_ob_high']
+                fvg_low = last_bar['bearish_fvg_low']
+                
+                entry_price = ob_low if not np.isnan(ob_low) else fvg_low
+                sl_price = ob_high if not np.isnan(ob_high) else (last_bar['confirmed_sh_1m'] if not np.isnan(last_bar['confirmed_sh_1m']) else last_bar['high'] + 15.0)
+                
+                if not np.isnan(entry_price) and not np.isnan(sl_price):
+                    if price >= sl_price:
+                        trade_advice = "❌ <b>建議交易</b>：無 (目前價格已漲破/觸及空頭停損點，空頭 OB 失效！)"
+                    else:
+                        sl_points = sl_price - entry_price
+                        if sl_points <= 5.0:
+                            sl_price = entry_price + 20.0
+                            sl_points = 20.0
+                        elif sl_points > MAX_SL_POINTS:
+                            sl_price = entry_price + MAX_SL_POINTS
+                            sl_points = MAX_SL_POINTS
+                        
+                        tp_price = entry_price - sl_points * DEFAULT_RR
+                        trade_advice = (
+                            f"💡 <b>空頭策略建議掛單</b>：\n"
+                            f"  👉 <b>建議進場價 (限價賣)</b>：<code>{entry_price:.1f}</code>\n"
+                            f"  🛑 <b>建議停損價 (SL)</b>：<code>{sl_price:.1f}</code> (風險: {sl_points:.1f} 點)\n"
+                            f"  🎯 <b>建議停利價 (TP)</b>：<code>{tp_price:.1f}</code> (預估利潤: {sl_points*DEFAULT_RR:.1f} 點, R:R={DEFAULT_RR})"
+                        )
+                else:
+                    trade_advice = "❌ <b>建議交易</b>：無 (未檢測到有效的空頭 OB / FVG 區間)"
+            
             tg_text = (
                 f"<b>🔔 SMC 交易訊號觸發通知</b>\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
@@ -293,6 +359,7 @@ class LiveMonitor:
                 f"🟢 多頭 OB：{bull_ob}\n"
                 f"🔴 空頭 OB：{bear_ob}\n"
                 f"🟢 多頭 FVG：{bull_fvg}\n"
-                f"🔴 空頭 FVG：{bear_fvg}\n"
+                f"🔴 空頭 FVG：{bear_fvg}\n\n"
+                f"{trade_advice}\n"
             )
             send_telegram_notification(tg_text)
