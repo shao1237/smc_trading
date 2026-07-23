@@ -13,6 +13,7 @@ from smc_trader.config import (
 )
 from smc_trader.smc_detector import SMCDetector
 from smc_trader.telegram_sender import send_telegram_notification
+from smc_trader.logger import get_logger
 
 # ANSI 顏色設定
 C_GREEN = "\033[92m"
@@ -22,6 +23,8 @@ C_BLUE = "\033[94m"
 C_CYAN = "\033[96m"
 C_BOLD = "\033[1m"
 C_RESET = "\033[0m"
+
+logger = get_logger()
 
 class LiveMonitor:
     """
@@ -50,7 +53,7 @@ class LiveMonitor:
 
     def _init_history(self):
         """生成或加載初始歷史數據，避免一開始無 Swing 點"""
-        print("正在載入初始歷史數據，建立結構基礎...")
+        logger.info("正在載入初始歷史數據，建立結構基礎...")
         
         # 1. 嘗試從快取數據加載真實數據 (僅在 shioaji 模式或快取存在時)
         from smc_trader.config import DATA_CACHE_DIR
@@ -74,10 +77,10 @@ class LiveMonitor:
                         'close': float(r['close']),
                         'volume': int(r['volume'])
                     })
-                print(f"成功自本地快取檔案 {os.path.basename(latest_cache)} 載入 {len(self.history_1m)} 根真實 1M K 線歷史數據！")
+                logger.info(f"成功自本地快取檔案 {os.path.basename(latest_cache)} 載入 {len(self.history_1m)} 根真實 1M K 線歷史數據！")
                 return
             except Exception as e:
-                print(f"嘗試自本地快取加載數據時失敗: {str(e)}，將改採隨機數據生成...")
+                logger.warning(f"嘗試自本地快取加載數據時失敗: {str(e)}，將改採隨機數據生成...")
         
         # 2. 隨機生成數據 (Fallback 或者是 mock 模式)
         np.random.seed(42)
@@ -109,7 +112,7 @@ class LiveMonitor:
                 'volume': vol
             })
             base_price = c
-        print(f"初始模擬歷史數據載入完畢，共 {len(self.history_1m)} 根 K 線。")
+        logger.info(f"初始模擬歷史數據載入完畢，共 {len(self.history_1m)} 根 K 線。")
 
     def run(self):
         """啟動監控"""
@@ -117,8 +120,8 @@ class LiveMonitor:
             try:
                 self._run_shioaji()
             except Exception as e:
-                print(f"{C_RED}[錯誤] Shioaji 真實監控啟動失敗: {str(e)}{C_RESET}")
-                print(f"{C_YELLOW}[提示] 將自動轉為模擬即時監控模式運行。{C_RESET}")
+                logger.error(f"Shioaji 真實監控啟動失敗: {str(e)}")
+                logger.warning(f"將自動轉為模擬即時監控模式運行。")
                 self.mode = "mock"
                 
         if self.mode == "mock":
@@ -130,9 +133,9 @@ class LiveMonitor:
             raise ValueError("Shioaji 登入資訊不足，請設定 api_key 與 secret_key")
 
         api = sj.Shioaji(simulation=SHIOAJI_SIMULATION)
-        print(f"{C_CYAN}正在登入 Shioaji API 進行實時監控...{C_RESET}")
+        logger.info(f"{C_CYAN}正在登入 Shioaji API 進行實時監控...{C_RESET}")
         api.login(api_key=self.api_key, secret_key=self.secret_key)
-        print(f"{C_GREEN}登入成功！正在取得台指期近月合約...{C_RESET}")
+        logger.info(f"{C_GREEN}登入成功！正在取得台指期近月合約...{C_RESET}")
         
         # 尋找當前近月合約
         futures = api.Contracts.Futures.TXF
@@ -144,9 +147,9 @@ class LiveMonitor:
         if contract is None:
             raise ValueError("找不到 TXFR1 期貨合約")
         
-        print(f"{C_GREEN}訂閱商品: {contract.code} - {contract.name}{C_RESET}")
-        print(f"{C_YELLOW}開始接收即時報價，按下 Ctrl+C 結束監控。{C_RESET}")
-        print("=" * 60)
+        logger.info(f"{C_GREEN}訂閱商品: {contract.code} - {contract.name}{C_RESET}")
+        logger.info(f"{C_YELLOW}開始接收即時報價，按下 Ctrl+C 結束監控。{C_RESET}")
+        logger.info("=" * 60)
 
         @api.on_tick_fop_v1()
         def on_tick(exchange, tick):
@@ -165,14 +168,14 @@ class LiveMonitor:
             while True:
                 time.sleep(1)
         except KeyboardInterrupt:
-            print(f"\n{C_YELLOW}監控已手動終止。{C_RESET}")
+            logger.info(f"監控已手動終止。")
             api.logout()
 
     def _run_mock(self):
         """模擬實時監控"""
-        print(f"{C_CYAN}啟動模擬實時監控 (1M K線加速為每 10 秒一根)...{C_RESET}")
-        print(f"{C_YELLOW}開始接收模擬報價，按下 Ctrl+C 結束監控。{C_RESET}")
-        print("=" * 70)
+        logger.info(f"{C_CYAN}啟動模擬實時監控 (1M K線加速為每 10 秒一根)...{C_RESET}")
+        logger.info(f"{C_YELLOW}開始接收模擬報價，按下 Ctrl+C 結束監控。{C_RESET}")
+        logger.info("=" * 70)
         
         last_price = self.history_1m[-1]['close']
         
@@ -191,7 +194,7 @@ class LiveMonitor:
                 time.sleep(2)
                 
         except KeyboardInterrupt:
-            print(f"\n{C_YELLOW}模擬監控已手動終止。{C_RESET}")
+            logger.info(f"模擬監控已手動終止。")
 
     def _process_new_tick(self, price: float, vol: int, dt: datetime.datetime):
         """處理傳入的即時報價並合建成 K 線"""
@@ -303,11 +306,11 @@ class LiveMonitor:
         # 輸出格式
         trend_color = C_GREEN if trend_5m == "BULLISH" else (C_RED if trend_5m == "BEARISH" else C_RESET)
         
-        print(f"[{ts_str}] 價格: {C_BOLD}{price}{C_RESET} | 大結構趨勢 (5M): {trend_color}{C_BOLD}{trend_5m}{C_RESET}")
-        print(f"       即時信號 : {signal_str}")
-        print(f"       多頭 OB  : {C_GREEN}{bull_ob}{C_RESET} | 空頭 OB  : {C_RED}{bear_ob}{C_RESET}")
-        print(f"       多頭 FVG : {C_GREEN}{bull_fvg}{C_RESET} | 空頭 FVG : {C_RED}{bear_fvg}{C_RESET}")
-        print("-" * 70)
+        logger.info(f"[{ts_str}] 價格: {C_BOLD}{price}{C_RESET} | 大結構趨勢 (5M): {trend_color}{C_BOLD}{trend_5m}{C_RESET}")
+        logger.info(f"       即時信號 : {signal_str}")
+        logger.info(f"       多頭 OB  : {C_GREEN}{bull_ob}{C_RESET} | 空頭 OB  : {C_RED}{bear_ob}{C_RESET}")
+        logger.info(f"       多頭 FVG : {C_GREEN}{bull_fvg}{C_RESET} | 空頭 FVG : {C_RED}{bear_fvg}{C_RESET}")
+        logger.info("-" * 70)
 
         # 發送 Telegram 通知
         if has_signal:
@@ -393,6 +396,7 @@ class LiveMonitor:
             )
             # 只有在有明確建議掛單（非垃圾/失效訊息）時才發送 Telegram 通知
             if "💡" in trade_advice:
+                logger.signal(f"訊號觸發，發送 Telegram 通知: {signal_tg_name}")
                 send_telegram_notification(tg_text)
             else:
-                print(f"       [過濾] 偵測到信號但建議無效，已跳過發送 Telegram 通知。")
+                logger.info(f"[過濾] 偵測到信號但建議無效，已跳過發送 Telegram 通知。")

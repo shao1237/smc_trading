@@ -94,11 +94,15 @@ class ShioajiDataProvider(DataProvider):
             all_dfs = []
             for idx, (sub_start, sub_end) in enumerate(sub_intervals):
                 print(f"  [{idx+1}/{len(sub_intervals)}] 下載子區間: {sub_start} 至 {sub_end}...")
-                kbars = self.api.kbars(
-                    contract=contract,
-                    start=sub_start,
-                    end=sub_end
-                )
+                try:
+                    kbars = self.api.kbars(
+                        contract=contract,
+                        start=sub_start,
+                        end=sub_end
+                    )
+                except Exception as sub_err:
+                    print(f"  警告：子區間 {sub_start} 至 {sub_end} 獲取失敗 ({str(sub_err)})，跳過該區間。")
+                    continue
                 if not kbars or len(kbars.ts) == 0:
                     print(f"  警告：子區間 {sub_start} 至 {sub_end} 未回傳數據，可能為假日或無開市。")
                     continue

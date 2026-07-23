@@ -11,7 +11,8 @@ class SMCDetector:
     """
     def __init__(self, swing_window_5m: int = 5, swing_window_1m: int = 3, 
                  volume_ma_period: int = 20, volume_mult: float = 1.3,
-                 atr_period: int = 14, atr_ma_period: int = 20, atr_mult: float = 1.0):
+                 atr_period: int = 14, atr_ma_period: int = 20, atr_mult: float = 1.0,
+                 pullback_buffer_pts: float = 0.0):
         self.swing_window_5m = swing_window_5m
         self.swing_window_1m = swing_window_1m
         self.volume_ma_period = volume_ma_period
@@ -19,6 +20,7 @@ class SMCDetector:
         self.atr_period = atr_period
         self.atr_ma_period = atr_ma_period
         self.atr_mult = atr_mult
+        self.pullback_buffer_pts = pullback_buffer_pts
 
     def detect_swings(self, df: pd.DataFrame, window: int) -> pd.DataFrame:
         """
@@ -80,6 +82,18 @@ class SMCDetector:
         last_sl = np.nan
         current_trend = "NONE"
 
+        # --- SMC 單次突破消耗與深回檔轉 NONE 機制 ---
+        # active_break_level：目前維持 current_trend 的那個「被突破的關鍵價位」。
+        #   BULLISH 時代表被向上突破的 swing high；BEARISH 時代表被向下突破的 swing low。
+        #   若價格深幅回落，收盤價「跌回」該價位之下 (或漲回之上)，代表原本的推動結構已失效，
+        #   趨勢自動降級為 NONE，而不是盲目維持原方向。
+        # consumed_sh / consumed_sl：記錄「已經被用來觸發過 BOS 的最高 swing high / 最低 swing low」。
+        #   同一個價位不會重複觸發同方向的 BOS；唯有價格再創出「新的、比 consumed 值更極端」的
+        #   swing high/low 並且實體突破，才能重新確立同方向趨勢，避免在盤整時反覆假突破同一價位。
+        active_break_level = np.nan
+        consumed_sh = np.nan
+        consumed_sl = np.nan
+
         highs = df_5m['high'].values
         lows = df_5m['low'].values
         closes = df_5m['close'].values
@@ -102,12 +116,35 @@ class SMCDetector:
             confirmed_sh_arr[i] = last_sh
             confirmed_sl_arr[i] = last_sl
 
-            # 檢測 BOS (實體收盤價突破)
-            # 只有當前收盤價與「在此之前已確認」的 last_sh/last_sl 做比較
-            if not np.isnan(last_sh) and closes[i] > last_sh:
-                current_trend = "BULLISH" # 向上 BOS
-            elif not np.isnan(last_sl) and closes[i] < last_sl:
-                current_trend = "BEARISH" # 向下 BOS
+            # 檢測「新鮮」BOS：實體收盤突破 last_sh/last_sl，且該價位尚未被消耗過
+            # (last_sh/last_sl 比之前 consumed 過的更高/更低，代表是真正的新高/新低)
+            fresh_bullish_bos = (
+                not np.isnan(last_sh) and closes[i] > last_sh and
+                (np.isnan(consumed_sh) or last_sh > consumed_sh)
+            )
+            fresh_bearish_bos = (
+                not np.isnan(last_sl) and closes[i] < last_sl and
+                (np.isnan(consumed_sl) or last_sl < consumed_sl)
+            )
+
+            if fresh_bullish_bos:
+                # 向上 BOS（新高突破，含反轉或創新高延續兩種情況）
+                current_trend = "BULLISH"
+                active_break_level = last_sh
+                consumed_sh = last_sh
+            elif fresh_bearish_bos:
+                # 向下 BOS（新低突破，含反轉或創新低延續兩種情況）
+                current_trend = "BEARISH"
+                active_break_level = last_sl
+                consumed_sl = last_sl
+            else:
+                # 沒有新的 BOS 發生時，檢查是否發生「深幅回檔」，趨勢降級為 NONE
+                if current_trend == "BULLISH" and not np.isnan(active_break_level) and closes[i] < (active_break_level - self.pullback_buffer_pts):
+                    current_trend = "NONE"
+                    active_break_level = np.nan
+                elif current_trend == "BEARISH" and not np.isnan(active_break_level) and closes[i] > (active_break_level + self.pullback_buffer_pts):
+                    current_trend = "NONE"
+                    active_break_level = np.nan
 
             trend_arr.append(current_trend)
 
@@ -130,7 +167,7 @@ class SMCDetector:
         # 我們先對 5M 資料建立以「結束時間」為 Key 的對照表
         # 通常 Resample 得到的 5M 時間戳如 09:00:00，其代表 [09:00, 09:04] 這段期間
         # 該 5M K 線在 09:05:00 之後的 1M K 線才能被正式存取其狀態
-        df_5m_lookup = df_5m_processed.copy()
+        df_5m_lookup = df_5m_processed[['ts', 'trend_5m']].copy()
         # 動態計算 5M K 線的實際跨度，自適應 Mock 模式 (50秒) 與真實模式 (5分鐘)
         if len(df_5m_lookup) >= 2:
             time_diff = df_5m_lookup['ts'].diff().median()
@@ -141,20 +178,31 @@ class SMCDetector:
             
         # 計算此根 5M K 線收盤的 1M 時間
         df_5m_lookup['close_1m_ts'] = df_5m_lookup['ts'] + close_delta
-        
-        # 建立時間對應字典
-        trend_dict = dict(zip(df_5m_lookup['close_1m_ts'], df_5m_lookup['trend_5m']))
-        
-        # 對 1M DataFrame 進行前向填充 5M 趨勢
-        df_1m['trend_5m'] = "NONE"
-        current_5m_trend = "NONE"
-        trend_5m_list = []
-        for ts in df_1m['ts']:
-            # 若此時剛好有 5M K 線收盤，更新大結構狀態
-            if ts in trend_dict:
-                current_5m_trend = trend_dict[ts]
-            trend_5m_list.append(current_5m_trend)
-        df_1m['trend_5m'] = trend_5m_list
+        df_5m_lookup = df_5m_lookup.sort_values('close_1m_ts').reset_index(drop=True)
+
+        # 注意：不可用「時間戳記完全相等」比對來對齊 (原本用 dict 查表的做法)。
+        # 離線回測資料的 1M 時間戳剛好整分對齊，相等比對不會出錯；
+        # 但即時監控 (monitor.py) 的 1M K 棒時間戳來自真實 tick 抵達時刻，
+        # 帶有不規則秒數/微秒，幾乎不可能與 close_1m_ts 完全相等，
+        # 會導致 trend_5m 在對齊失敗後「凍結」在最後一次命中的值。
+        # 改用 merge_asof(direction='backward')：為每根 1M K 棒找出「時間 <= 自己」
+        # 的最後一根已收盤 5M K 棒，同樣不會用到尚未收盤的 5M 資料，維持無未來函數。
+        df_1m = df_1m.sort_values('ts').reset_index(drop=True)
+        # 若 df_1m 已帶有先前呼叫留下的 trend_5m 欄位（例如 Walk-Forward 對同一份
+        # 已處理過的資料重新切片、再次呼叫本函式），先移除舊欄位，
+        # 避免 merge_asof 因兩邊都有 trend_5m 而產生 trend_5m_x / trend_5m_y，
+        # 造成後面 df_1m['trend_5m'] 找不到欄位。確保本函式可重複呼叫。
+        if 'trend_5m' in df_1m.columns:
+            df_1m = df_1m.drop(columns=['trend_5m'])
+        df_1m = pd.merge_asof(
+            df_1m,
+            df_5m_lookup[['close_1m_ts', 'trend_5m']],
+            left_on='ts',
+            right_on='close_1m_ts',
+            direction='backward'
+        )
+        df_1m['trend_5m'] = df_1m['trend_5m'].fillna('NONE')
+        df_1m = df_1m.drop(columns=['close_1m_ts'])
 
         # 3. 計算 Volume MA 用於檢測爆量
         df_1m['vol_ma'] = df_1m['volume'].rolling(window=self.volume_ma_period).mean()
@@ -227,7 +275,6 @@ class SMCDetector:
                 if is_sh_1m[confirm_idx]:
                     last_sh_1m = highs[confirm_idx]
                 if is_sl_1m[confirm_idx]:
-                    last_sl = lows[confirm_idx] # 修正：應該是 last_sl_1m
                     last_sl_1m = lows[confirm_idx]
 
             df_1m.at[i, 'confirmed_sh_1m'] = last_sh_1m
