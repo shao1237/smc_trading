@@ -39,7 +39,8 @@ class LiveMonitor:
             swing_window_5m=SWING_WINDOW_5M,
             swing_window_1m=SWING_WINDOW_1M,
             volume_ma_period=VOLUME_MA_PERIOD,
-            volume_mult=VOLUME_MULT
+            volume_mult=VOLUME_MULT,
+            pullback_buffer_pts=20.0
         )
         
         # 歷史 1M K 線數據庫
@@ -320,8 +321,17 @@ class LiveMonitor:
             is_bullish_signal = "bullish" in signal_tg_name.lower() or "sweep low" in signal_tg_name.lower() or "mss bullish" in signal_tg_name.lower() or "cisd bullish" in signal_tg_name.lower()
             is_bearish_signal = "bearish" in signal_tg_name.lower() or "sweep high" in signal_tg_name.lower() or "mss bearish" in signal_tg_name.lower() or "cisd bearish" in signal_tg_name.lower()
             
+            # 檢查過濾條件 (1. 09:00 - 11:00 建倉時間 restriction, 2. 0.9x ATR 波動濾網)
+            bar_time = last_bar['ts'].time()
+            is_valid_time = (datetime.time(9, 0) <= bar_time <= datetime.time(11, 0)) if self.mode != "mock" else True
+            is_volatile = last_bar.get('is_volatile', True)
+
             trade_advice = ""
-            if is_bullish_signal:
+            if not is_valid_time:
+                trade_advice = "❌ <b>建議交易</b>：無 (目前非 09:00 - 11:00 建倉黃金時段，系統禁止新建倉！)"
+            elif not is_volatile:
+                trade_advice = "❌ <b>建議交易</b>：無 (目前處於低波動盤整期，ATR 波動濾網攔截！)"
+            elif is_bullish_signal:
                 ob_low = last_bar['bullish_ob_low']
                 ob_high = last_bar['bullish_ob_high']
                 fvg_high = last_bar['bullish_fvg_high']
