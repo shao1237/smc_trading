@@ -108,20 +108,13 @@ class Backtester:
                 if self.position is not None:
                     continue
 
-            # 4. 尋找交易訊號
-            # 限制只能在 09:00 - 11:00 之間建立新掛單委託
-            bar_time = ts.time()
-            if not (datetime.time(9, 0) <= bar_time <= datetime.time(11, 0)):
-                continue
-
+            # 4. 尋找交易訊號 (已暫時取消 09:00-11:00 時間限制與 NONE 結構限制)
             # 限制波動度合格
             if 'is_volatile' in bar and not bar['is_volatile']:
                 continue
 
-            # 必須符合大趨勢 (5M BOS)
-            if trend_5m == "BULLISH":
-                # 做多條件：MSS Bullish 且 CISD Bullish 同時出現，或在最近 3 根 K 線內出現
-                # 為了避免遺漏，我們檢查當前或前 2 根的信號
+            # 做多條件：5M 為 BULLISH 或 NONE 時均可觸發
+            if trend_5m in ["BULLISH", "NONE"]:
                 is_signal = bar['mss_bullish'] or bar['cisd_bullish'] or bar['sweep_low']
                 if is_signal:
                     entry_type = "Sweep Low" if bar['sweep_low'] else ("MSS Bullish" if bar['mss_bullish'] else "CISD Bullish")
@@ -170,7 +163,8 @@ class Backtester:
                             'bars_pending': 0
                         }
 
-            elif trend_5m == "BEARISH":
+            # 做空條件：5M 為 BEARISH 或 NONE 時均可觸發 (若當前無待撮合多單)
+            if self.pending_order is None and trend_5m in ["BEARISH", "NONE"]:
                 # 做空條件
                 is_signal = bar['mss_bearish'] or bar['cisd_bearish'] or bar['sweep_high']
                 if is_signal:
