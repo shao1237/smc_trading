@@ -122,8 +122,9 @@ class Backtester:
             if trend_5m == "BULLISH":
                 # 做多條件：MSS Bullish 且 CISD Bullish 同時出現，或在最近 3 根 K 線內出現
                 # 為了避免遺漏，我們檢查當前或前 2 根的信號
-                is_signal = bar['mss_bullish'] or bar['cisd_bullish']
+                is_signal = bar['mss_bullish'] or bar['cisd_bullish'] or bar['sweep_low']
                 if is_signal:
+                    entry_type = "Sweep Low" if bar['sweep_low'] else ("MSS Bullish" if bar['mss_bullish'] else "CISD Bullish")
                     # 決定進場限價與止損
                     # 我們使用最近的 FVG 或 OB 來定價
                     # 優先使用 OB (Order Block) 的上沿，其次為 FVG 上沿
@@ -160,6 +161,7 @@ class Backtester:
                         
                         self.pending_order = {
                             'direction': 'LONG',
+                            'entry_type': entry_type,
                             'entry_price': entry_price,
                             'sl': sl_price,
                             'tp': tp_price,
@@ -170,8 +172,9 @@ class Backtester:
 
             elif trend_5m == "BEARISH":
                 # 做空條件
-                is_signal = bar['mss_bearish'] or bar['cisd_bearish']
+                is_signal = bar['mss_bearish'] or bar['cisd_bearish'] or bar['sweep_high']
                 if is_signal:
+                    entry_type = "Sweep High" if bar['sweep_high'] else ("MSS Bearish" if bar['mss_bearish'] else "CISD Bearish")
                     entry_price = np.nan
                     ob_low = bar['bearish_ob_low']
                     fvg_low = bar['bearish_fvg_low']
@@ -203,6 +206,7 @@ class Backtester:
                         
                         self.pending_order = {
                             'direction': 'SHORT',
+                            'entry_type': entry_type,
                             'entry_price': entry_price,
                             'sl': sl_price,
                             'tp': tp_price,
@@ -238,6 +242,7 @@ class Backtester:
             # 轉換為持倉
             self.position = {
                 'direction': po['direction'],
+                'entry_type': po.get('entry_type', 'UNKNOWN'),
                 'entry_price': po['entry_price'],
                 'sl': po['sl'],
                 'tp': po['tp'],
@@ -313,6 +318,7 @@ class Backtester:
             # 記錄交易
             trade_record = {
                 'direction': pos['direction'],
+                'entry_type': pos.get('entry_type', 'UNKNOWN'),
                 'entry_time': pos['entry_time'],
                 'entry_price': pos['entry_price'],
                 'exit_time': ts,
@@ -346,6 +352,7 @@ class Backtester:
         
         trade_record = {
             'direction': pos['direction'],
+            'entry_type': pos.get('entry_type', 'UNKNOWN'),
             'entry_time': pos['entry_time'],
             'entry_price': pos['entry_price'],
             'exit_time': ts,
