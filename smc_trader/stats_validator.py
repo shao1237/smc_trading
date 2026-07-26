@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import datetime
 from typing import List, Dict, Any, Tuple
 from smc_trader.backtester import Backtester
 from smc_trader.smc_detector import SMCDetector
@@ -69,32 +70,19 @@ class StatsValidator:
             }
 
         # 提取每筆交易的實際點數變化 (不含方向)
-        # 用來模擬隨機買賣方向下的損益
         raw_points = np.array([abs(t['gross_points']) for t in trades])
-        # 我們需要扣減的滑價點數 (每筆 2 * slippage) 與手續費
-        # 來計算真實點數
         net_pnls = np.array([t['pnl'] for t in trades])
         real_profit = np.sum(net_pnls)
         
-        # 為了模擬隨機方向
-        # 每次隨機分配 +1 (LONG) 或 -1 (SHORT) 給每筆交易點數，
-        # 並扣除手續費及滑價
         n_trades = len(trades)
         random_profits = []
-        
         rng = np.random.default_rng(42)
         
         for _ in range(num_permutations):
-            # 隨機生成 +1 或 -1
             random_dirs = rng.choice([-1, 1], size=n_trades)
-            # 計算隨機交易盈虧點數
             rand_gross_points = raw_points * random_dirs
-            # 扣減單邊滑價與手續費的點數等值 (大台 1點=200元，單邊手續費50元=0.25點，單邊滑價2點)
-            # 在 backtester 中，手續費是 50 元/單邊，滑價 2 點/單邊
-            # 故來回成本 = 4 點滑價 + 100 元 (0.5 點大台價值) = 4.5 點
-            rand_net_points = rand_gross_points - 4.0 # 扣減來回滑價
-            rand_pnl = (rand_net_points * 200.0) - 100.0 # 扣減來回手續費 100 NTD
-            
+            rand_net_points = rand_gross_points - 2.0
+            rand_pnl = (rand_net_points * 50.0) - 100.0
             random_profits.append(np.sum(rand_pnl))
             
         random_profits = np.array(random_profits)
@@ -129,79 +117,141 @@ class StatsValidator:
         }
 
     def run_walk_forward(self, df_1m: pd.DataFrame, df_5m: pd.DataFrame, 
-                         num_folds: int = 3, train_ratio: float = 0.7) -> Dict[str, Any]:
+                          num_folds: int = 3, train_ratio: float = 0.7,
+                          exec_type: str = "B", t_start=None, t_end=None) -> Dict[str, Any]:
         """
         Walk-Forward (向前推進分析)。
         將數據滾動劃分，在 IS 上尋找最佳 R:R 參數，在 OOS 上評估真實泛化表現。
         """
+        if t_start is None: t_start = datetime.time(0, 0)
+        if t_end is None: t_end = datetime.time(23, 59)
+        
         n = len(df_1m)
         fold_size = int(n / (num_folds + 1))
         
         is_profits = []
         oos_profits = []
+        rr_candidates = [2.5, 3.5, 4.8, 5.5]
+        detector = SMCDetector(pullback_buffer_pts=20.0, atr_mult=0.90)
         
-        # 測試最佳化的 R:R 候選參數
-        rr_candidates = [1.5, 2.0, 2.5, 3.0, 3.5]
-        
-        # 實體化回測引擎
-        detector = SMCDetector()
-        
-        print("開始向前推進分析 (Walk-Forward Analysis)...")
-        
+        def run_custom_engine(df_proc, rr_val):
+            trades = []
+            position = None
+            pending_order = None
+            balance = 1000000.0
+            slippage, commission, point_value = 1.0, 50.0, 50.0
+            max_sl_pts = 80.0
+            m_len = len(df_proc)
+            
+            for i in range(m_len - 1):
+                bar = df_proc.iloc[i].to_dict()
+                ts = bar['ts']
+                close, high, low, trend_5m = bar['close'], bar['high'], bar['low'], bar['trend_5m']
+                bar_time = ts.time()
+                
+                if position is not None:
+                    dir_m = 1 if position['direction'] == 'LONG' else -1
+                    closed, exit_p = False, 0.0
+                    if position['direction'] == 'LONG':
+                        if low <= position['sl']: exit_p, closed = position['sl'], True
+                        elif high >= position['tp']: exit_p, closed = position['tp'], True
+                    else:
+                        if high >= position['sl']: exit_p, closed = position['sl'], True
+                        elif low <= position['tp']: exit_p, closed = position['tp'], True
+                    if not closed and (datetime.time(13, 30) <= bar_time <= datetime.time(13, 45)):
+                        exit_p, closed = close, True
+                    if closed:
+                        net_pts = (exit_p - position['entry_price']) * dir_m - (2.0 * slippage)
+                        net_pnl = net_pts * point_value - (2.0 * commission)
+                        balance += net_pnl
+                        trades.append({'pnl': net_pnl})
+                        position = None
+                        
+                if exec_type.startswith("A") and pending_order is not None:
+                    po = pending_order
+                    trig = (low <= po['entry_price']) if po['direction'] == 'LONG' else (high >= po['entry_price'])
+                    if trig:
+                        position = {'direction': po['direction'], 'entry_price': po['entry_price'], 'sl': po['sl'], 'tp': po['tp']}
+                        pending_order = None
+                        continue
+                    else:
+                        po['bars_pending'] += 1
+                        if po['bars_pending'] >= 10: pending_order = None
+                        
+                if position is not None or pending_order is not None: continue
+                if not (t_start <= bar_time <= t_end): continue
+                if 'is_volatile' in bar and not bar['is_volatile']: continue
+                
+                if trend_5m == "BULLISH":
+                    if bar['mss_bullish'] or bar['cisd_bullish'] or bar['sweep_low']:
+                        sl_price = bar['bullish_ob_low'] if not np.isnan(bar['bullish_ob_low']) else (bar['confirmed_sl_1m'] if not np.isnan(bar['confirmed_sl_1m']) else low - 15.0)
+                        if exec_type.startswith("A"):
+                            e_price = bar['bullish_ob_high'] if not np.isnan(bar['bullish_ob_high']) else bar['bullish_fvg_high']
+                            if not np.isnan(e_price) and close > e_price:
+                                sl_pts = e_price - sl_price
+                                if sl_pts <= 5.0: sl_price, sl_pts = e_price - 20.0, 20.0
+                                if sl_pts > max_sl_pts: sl_price, sl_pts = e_price - max_sl_pts, max_sl_pts
+                                pending_order = {'direction': 'LONG', 'entry_price': e_price, 'sl': sl_price, 'tp': e_price + sl_pts * rr_val, 'bars_pending': 0}
+                        else:
+                            next_open = df_proc.iloc[i+1]['open']
+                            if next_open > sl_price:
+                                sl_pts = next_open - sl_price
+                                if sl_pts <= 5.0: sl_price, sl_pts = next_open - 20.0, 20.0
+                                if sl_pts > max_sl_pts: sl_price, sl_pts = next_open - max_sl_pts, max_sl_pts
+                                position = {'direction': 'LONG', 'entry_price': next_open, 'sl': sl_price, 'tp': next_open + sl_pts * rr_val}
+                elif trend_5m == "BEARISH":
+                    if bar['mss_bearish'] or bar['cisd_bearish'] or bar['sweep_high']:
+                        sl_price = bar['bearish_ob_high'] if not np.isnan(bar['bearish_ob_high']) else (bar['confirmed_sh_1m'] if not np.isnan(bar['confirmed_sh_1m']) else high + 15.0)
+                        if exec_type.startswith("A"):
+                            e_price = bar['bearish_ob_low'] if not np.isnan(bar['bearish_ob_low']) else bar['bearish_fvg_low']
+                            if not np.isnan(e_price) and close < e_price:
+                                sl_pts = sl_price - e_price
+                                if sl_pts <= 5.0: sl_price, sl_pts = e_price + 20.0, 20.0
+                                if sl_pts > max_sl_pts: sl_price, sl_pts = e_price + max_sl_pts, max_sl_pts
+                                pending_order = {'direction': 'SHORT', 'entry_price': e_price, 'sl': sl_price, 'tp': e_price - sl_pts * rr_val, 'bars_pending': 0}
+                        else:
+                            next_open = df_proc.iloc[i+1]['open']
+                            if next_open < sl_price:
+                                sl_pts = sl_price - next_open
+                                if sl_pts <= 5.0: sl_price, sl_pts = next_open + 20.0, 20.0
+                                if sl_pts > max_sl_pts: sl_price, sl_pts = next_open + max_sl_pts, max_sl_pts
+                                position = {'direction': 'SHORT', 'entry_price': next_open, 'sl': sl_price, 'tp': next_open - sl_pts * rr_val}
+                                
+            return sum([t['pnl'] for t in trades]) if trades else 0.0
+
         for fold in range(num_folds):
-            # 劃分時間範圍
-            # 例如 fold 0: 訓練集 [0 to 2*fold_size]，測試集 [2*fold_size to 3*fold_size]
-            # fold 1: 訓練集 [fold_size to 3*fold_size]，測試集 [3*fold_size to 4*fold_size]
             start_idx = fold * fold_size
             train_end_idx = start_idx + int(fold_size * 2 * train_ratio)
             test_end_idx = start_idx + fold_size * 2
+            if test_end_idx > n: break
             
-            if test_end_idx > n:
-                break
-                
             df_train_1m = df_1m.iloc[start_idx:train_end_idx].reset_index(drop=True)
             df_test_1m = df_1m.iloc[train_end_idx:test_end_idx].reset_index(drop=True)
             
-            # 對訓練集和測試集提取對齊的 5M 結構
-            # 為了簡化，在此直接用 index 進行過濾
             train_ts_start, train_ts_end = df_train_1m['ts'].min(), df_train_1m['ts'].max()
             test_ts_start, test_ts_end = df_test_1m['ts'].min(), df_test_1m['ts'].max()
             
             df_train_5m = df_5m[(df_5m['ts'] >= train_ts_start) & (df_5m['ts'] <= train_ts_end)].reset_index(drop=True)
             df_test_5m = df_5m[(df_5m['ts'] >= test_ts_start) & (df_5m['ts'] <= test_ts_end)].reset_index(drop=True)
             
-            # 計算特徵
             df_train_proc = detector.process_1m_signals(df_train_1m, detector.process_5m_structure(df_train_5m))
             df_test_proc = detector.process_1m_signals(df_test_1m, detector.process_5m_structure(df_test_5m))
             
-            # 1. 在 In-Sample (IS) 上最佳化參數
-            best_rr = 2.5
+            best_rr = 4.8
             best_is_profit = -float('inf')
             
             for rr in rr_candidates:
-                backtester = Backtester(default_rr=rr)
-                trades, _ = backtester.run(df_train_proc)
-                pnl = sum([t['pnl'] for t in trades]) if trades else 0.0
+                pnl = run_custom_engine(df_train_proc, rr)
                 if pnl > best_is_profit:
                     best_is_profit = pnl
                     best_rr = rr
-            
-            # 2. 將最佳參數套用到 Out-Of-Sample (OOS)
-            backtester_oos = Backtester(default_rr=best_rr)
-            trades_oos, _ = backtester_oos.run(df_test_proc)
-            best_oos_profit = sum([t['pnl'] for t in trades_oos]) if trades_oos else 0.0
-            
+                    
+            best_oos_profit = run_custom_engine(df_test_proc, best_rr)
             is_profits.append(best_is_profit)
             oos_profits.append(best_oos_profit)
             
-            print(f"  Fold {fold+1}: IS 最優 R:R={best_rr} (獲利: {best_is_profit:,.0f} NTD) | OOS 實戰獲利: {best_oos_profit:,.0f} NTD")
-            
         avg_is = np.mean(is_profits) if is_profits else 0.0
         avg_oos = np.mean(oos_profits) if oos_profits else 0.0
-        
-        # 計算向前推進效率 WFE
-        # WFE = avg_oos / avg_is
-        # 為了避免除以 0，且符合實踐：
         wfe = (avg_oos / avg_is) * 100 if avg_is > 0 else (100.0 if avg_oos > 0 else 0.0)
         passed = wfe >= 50.0
         
@@ -209,9 +259,5 @@ class StatsValidator:
             'avg_is_profit': round(float(avg_is), 1),
             'avg_oos_profit': round(float(avg_oos), 1),
             'wfe': round(wfe, 2),
-            'passed': bool(passed),
-            'folds_data': {
-                'is_profits': is_profits,
-                'oos_profits': oos_profits
-            }
+            'passed': bool(passed)
         }
