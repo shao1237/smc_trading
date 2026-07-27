@@ -46,7 +46,9 @@ INTRADAY_EXIT_END = "13:45"    # 強制平倉截止時間 (日盤結束)
 
 # --- Telegram 設定 ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "-1004375180786")
+TELEGRAM_SIGNAL_CHAT_ID = os.getenv("TELEGRAM_SIGNAL_CHAT_ID", "-1004375180786")       # 即時進場訊號頻道
+TELEGRAM_SETTLEMENT_CHAT_ID = os.getenv("TELEGRAM_SETTLEMENT_CHAT_ID", "-1004387856503") # 平倉戰報績效頻道
 
 # --- 資料庫/快取設定 ---
 DATA_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data_cache")

@@ -9,7 +9,7 @@ from typing import List, Dict, Any, Optional
 from smc_trader.config import (
     SHIOAJI_API_KEY, SHIOAJI_SECRET_KEY, SHIOAJI_SIMULATION,
     SWING_WINDOW_5M, SWING_WINDOW_1M, VOLUME_MA_PERIOD, VOLUME_MULT,
-    DEFAULT_RR, MAX_SL_POINTS
+    DEFAULT_RR, MAX_SL_POINTS, TELEGRAM_SIGNAL_CHAT_ID, TELEGRAM_SETTLEMENT_CHAT_ID
 )
 from smc_trader.smc_detector import SMCDetector
 from smc_trader.telegram_sender import send_telegram_notification
@@ -354,8 +354,8 @@ class LiveMonitor:
                             f"🚨 訊號類型：{signal_tg_name}\n"
                             f"💡 多單限價買：{e_int} | SL：{sl_int}  | TP：{tp_int}"
                         )
-                        logger.signal(f"訊號觸發，發送 Telegram 精簡通知: {signal_tg_name}")
-                        send_telegram_notification(tg_text)
+                        logger.signal(f"訊號觸發，發送 Telegram 即時監控通知 (ID: {TELEGRAM_SIGNAL_CHAT_ID}): {signal_tg_name}")
+                        send_telegram_notification(tg_text, chat_id=TELEGRAM_SIGNAL_CHAT_ID)
                         self._place_simulated_2stage_order("LONG", entry_price, sl_price, tp1_price)
                         
                 elif is_bearish_signal:
@@ -390,8 +390,8 @@ class LiveMonitor:
                             f"🚨 訊號類型：{signal_tg_name}\n"
                             f"💡 空單限價賣：{e_int} | SL：{sl_int}  | TP：{tp_int}"
                         )
-                        logger.signal(f"訊號觸發，發送 Telegram 精簡通知: {signal_tg_name}")
-                        send_telegram_notification(tg_text)
+                        logger.signal(f"訊號觸發，發送 Telegram 即時監控通知 (ID: {TELEGRAM_SIGNAL_CHAT_ID}): {signal_tg_name}")
+                        send_telegram_notification(tg_text, chat_id=TELEGRAM_SIGNAL_CHAT_ID)
                         self._place_simulated_2stage_order("SHORT", entry_price, sl_price, tp1_price)
 
     def _place_simulated_2stage_order(self, direction: str, entry_price: float, sl_price: float, tp1_price: float):
@@ -426,3 +426,108 @@ class LiveMonitor:
                 logger.signal(f"✅ [Shioaji 模擬帳戶下單成功] 交易單號: {trade.order.id}")
             except Exception as e:
                 logger.error(f"❌ [Shioaji 模擬帳戶下單失敗]: {str(e)}")
+
+    def _check_position_settlement(self, last_bar: Dict[str, Any]):
+        """即時檢查持倉是否到達 TP1 (3.0x RR)、保本點 SL、或反轉訊號，並自動發送 Telegram 戰報至平倉頻道 (-1004387856503)"""
+        pos = self.active_position
+        if pos is None:
+            return
+
+        price = last_bar['close']
+        high = last_bar['high']
+        low = last_bar['low']
+        dt_str = last_bar['ts'].strftime('%Y-%m-%d %H:%M:%S')
+        
+        dir_label = "多單 (LONG)" if pos['direction'] == 'LONG' else "空單 (SHORT)"
+        dir_mult = 1 if pos['direction'] == 'LONG' else -1
+        
+        # Stage 1: 尚未到達 TP1 (持有 100% 部位, 2口)
+        if pos['stage'] == 1:
+            is_sl_hit = (low <= pos['sl']) if pos['direction'] == 'LONG' else (high >= pos['sl'])
+            if is_sl_hit:
+                sl_p = pos['sl']
+                net_pts = (sl_p - pos['entry_price']) * dir_mult - 2.0
+                net_pnl = (net_pts * 50.0) - 100.0
+                
+                msg = (
+                    f"🛑 <b>[SMC 模擬單平倉戰報 - 停損出場]</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"<b>交易標的</b>：台指期近月 (TXFR1)\n"
+                    f"<b>交易方向</b>：{dir_label}\n"
+                    f"<b>平倉時間</b>：{dt_str}\n"
+                    f"<b>平倉原因</b>：🛑 觸及 SL 停損價\n\n"
+                    f"<b>進場價格</b>：<code>{int(round(pos['entry_price']))}</code>\n"
+                    f"<b>平倉價格</b>：<code>{int(round(sl_p))}</code>\n"
+                    f"<b>平倉部位</b>：2 口\n"
+                    f"<b>本次盈虧</b>：<code>{net_pnl:+,.0f} NTD</code> ({net_pts:+.1f} 點)"
+                )
+                logger.signal(f"模擬單觸及 SL 停損，發送平倉戰報至 ID {TELEGRAM_SETTLEMENT_CHAT_ID}: {net_pnl:+,.0f} NTD")
+                send_telegram_notification(msg, chat_id=TELEGRAM_SETTLEMENT_CHAT_ID)
+                self.active_position = None
+                return
+                
+            is_tp1_hit = (high >= pos['tp1']) if pos['direction'] == 'LONG' else (low <= pos['tp1'])
+            if is_tp1_hit:
+                tp1_p = pos['tp1']
+                net_pts = (tp1_p - pos['entry_price']) * dir_mult - 2.0
+                net_pnl_50 = ((net_pts * 50.0) - 100.0) * 0.5
+                
+                pos['stage'] = 2
+                pos['sl'] = pos['entry_price']  # 移動保本
+                pos['pnl_stage1'] = net_pnl_50
+                
+                msg = (
+                    f"🎉 <b>[SMC 模擬單平倉戰報 - 部分停利]</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"<b>交易標的</b>：台指期近月 (TXFR1)\n"
+                    f"<b>交易方向</b>：{dir_label}\n"
+                    f"<b>平倉時間</b>：{dt_str}\n"
+                    f"<b>平倉原因</b>：🎯 到達 TP1 第一目標 (3.0x RR)！\n\n"
+                    f"<b>進場價格</b>：<code>{int(round(pos['entry_price']))}</code>\n"
+                    f"<b>平倉價格</b>：<code>{int(round(tp1_p))}</code>\n"
+                    f"<b>平倉部位</b>：1 口 (50% 部位落袋為安)\n"
+                    f"<b>本次盈虧</b>：<code>{net_pnl_50:+,.0f} NTD</code>\n\n"
+                    f"🛡️ <b>風控狀態</b>：剩餘 1 口部位停損價已自動拉回保本價 (<code>{int(round(pos['entry_price']))}</code>)！"
+                )
+                logger.signal(f"模擬單觸及 TP1 平倉 50%，發送部分停利戰報至 ID {TELEGRAM_SETTLEMENT_CHAT_ID}: {net_pnl_50:+,.0f} NTD")
+                send_telegram_notification(msg, chat_id=TELEGRAM_SETTLEMENT_CHAT_ID)
+                return
+
+        # Stage 2: 已平倉 50% 且保本 (持有剩餘 50% 部位, 1口)
+        elif pos['stage'] == 2:
+            closed = False
+            exit_p = 0.0
+            reason = ""
+            
+            if pos['direction'] == 'LONG':
+                if low <= pos['sl']:
+                    exit_p, reason, closed = pos['sl'], "🛑 觸及進場保本價", True
+                elif last_bar['mss_bearish'] or last_bar['sweep_high']:
+                    exit_p, reason, closed = price, "🚨 檢測到反向空頭 SMC 訊號", True
+            else: # SHORT
+                if high >= pos['sl']:
+                    exit_p, reason, closed = pos['sl'], "🛑 觸及進場保本價", True
+                elif last_bar['mss_bullish'] or last_bar['sweep_low']:
+                    exit_p, reason, closed = price, "🚨 檢測到反向多頭 SMC 訊號", True
+                    
+            if closed:
+                net_pts = (exit_p - pos['entry_price']) * dir_mult - 2.0
+                net_pnl_50 = ((net_pts * 50.0) - 100.0) * 0.5
+                tot_pnl = pos.get('pnl_stage1', 0.0) + net_pnl_50
+                
+                msg = (
+                    f"🎯 <b>[SMC 模擬單平倉戰報 - 最終結算]</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"<b>交易標的</b>：台指期近月 (TXFR1)\n"
+                    f"<b>交易方向</b>：{dir_label}\n"
+                    f"<b>平倉時間</b>：{dt_str}\n"
+                    f"<b>平倉原因</b>：{reason}\n\n"
+                    f"<b>進場價格</b>：<code>{int(round(pos['entry_price']))}</code>\n"
+                    f"<b>平倉價格</b>：<code>{int(round(exit_p))}</code>\n"
+                    f"<b>平倉部位</b>：1 口 (剩餘 50% 部位)\n"
+                    f"<b>後半段損益</b>：<code>{net_pnl_50:+,.0f} NTD</code>\n\n"
+                    f"🏆 <b>該單累積總損益</b>：<code>{tot_pnl:+,.0f} NTD</code> (本單圓滿結束！)"
+                )
+                logger.signal(f"模擬單最終平倉，發送最終結算戰報至 ID {TELEGRAM_SETTLEMENT_CHAT_ID}: {tot_pnl:+,.0f} NTD")
+                send_telegram_notification(msg, chat_id=TELEGRAM_SETTLEMENT_CHAT_ID)
+                self.active_position = None
