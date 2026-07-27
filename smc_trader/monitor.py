@@ -46,8 +46,8 @@ class LiveMonitor:
         # 歷史 1M K 線數據庫
         self.history_1m: List[Dict[str, Any]] = []
         
-        # 當前進行中的 1M K 線
-        self.current_bar_1m: Optional[Dict[str, Any]] = None
+        # 當前模擬/實盤持倉追蹤 (二階段停利與保本管理)
+        self.active_position: Optional[Dict[str, Any]] = None
         
         # 預先載入一部分歷史數據以讓 Swing Points 能夠在初始時就能被計算
         self._init_history()
@@ -228,9 +228,6 @@ class LiveMonitor:
                 if len(self.history_1m) > 2000: # 擴大長度限制至 2000 根以容納更多 Swing 歷史
                     self.history_1m.pop(0)
                 
-                # 計算最新 SMC 指標並在螢幕上更新！
-                self._analyze_and_print_state()
-                
                 # 開啟新的一根 K 線
                 self.current_bar_1m = {
                     'ts': dt,
@@ -245,9 +242,6 @@ class LiveMonitor:
         """對當前歷史 K 線數據進行 SMC 特徵辨識，並精美輸出"""
         df_1m = pd.DataFrame(self.history_1m)
         
-        # 合成 5M
-        # 為了能在短歷史中運行，resample 到 5M
-        # 模擬模式下 5M K 線為 5 根 1M K 線 (50秒)
         rule = '50s' if self.mode == "mock" else '5min'
         df_5m = df_1m.resample(rule, on='ts').agg({
             'open': 'first',
@@ -266,7 +260,10 @@ class LiveMonitor:
         ts_str = last_bar['ts'].strftime('%H:%M:%S')
         price = last_bar['close']
         trend_5m = last_bar['trend_5m']
-        
+
+        # 即時追蹤持倉是否平倉並發送 Telegram 戰報
+        self._check_position_settlement(last_bar)
+
         # 檢測是否有特殊信號
         has_signal = False
         signal_tg_name = ""
@@ -404,6 +401,15 @@ class LiveMonitor:
         tp_int = int(round(tp1_price))
         
         logger.info(f"🤖 [Shioaji 模擬下單觸發] 自動發起 2 口小台 {direction} 委託 | 限價: {e_int}, SL: {sl_int}, TP1: {tp_int}")
+        
+        # 設定即時持倉追蹤 (二階段停利)
+        self.active_position = {
+            'direction': direction,
+            'entry_price': entry_price,
+            'sl': sl_price,
+            'tp1': tp1_price,
+            'stage': 1
+        }
         
         if hasattr(self, 'api') and self.api is not None and hasattr(self, 'contract') and self.contract is None:
             try:
