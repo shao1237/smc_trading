@@ -181,3 +181,6 @@
 [pid:18924] 2026-07-26T20:22:49.892740Z  INFO shioaji::api::api_v1::contracts::api: Fetched 2512 FUT contracts (1 pages)
 [pid:18924] 2026-07-26T20:22:51.034574Z  INFO shioaji::api::api_v1::contracts::api: Fetched 9023 OPT contracts (2 pages)
 [pid:18924] 2026-07-26T20:22:51.055851Z  INFO _core::api::auth::login: Loaded 53868 contracts after login
+[pid:18924] 2026-07-27T19:06:54.608576Z  INFO shioaji::api::token_pool: Removed invalid token from slot 1
+[pid:18924] 2026-07-27T19:06:54.609845Z  INFO shioaji::api: msg receiver error: Closed
+[pid:18924] 2026-07-27T19:06:54.609883Z  INFO shioaji::api: P2P receiver closed: Closed
