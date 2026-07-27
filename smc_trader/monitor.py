@@ -359,6 +359,7 @@ class LiveMonitor:
                         )
                         logger.signal(f"訊號觸發，發送 Telegram 精簡通知: {signal_tg_name}")
                         send_telegram_notification(tg_text)
+                        self._place_simulated_2stage_order("LONG", entry_price, sl_price, tp1_price)
                         
                 elif is_bearish_signal:
                     ob_low = last_bar['bearish_ob_low']
@@ -394,3 +395,28 @@ class LiveMonitor:
                         )
                         logger.signal(f"訊號觸發，發送 Telegram 精簡通知: {signal_tg_name}")
                         send_telegram_notification(tg_text)
+                        self._place_simulated_2stage_order("SHORT", entry_price, sl_price, tp1_price)
+
+    def _place_simulated_2stage_order(self, direction: str, entry_price: float, sl_price: float, tp1_price: float):
+        """透過 Shioaji 模擬環境自動送出 2 口小台 (TXFR1) 限價進場與二階段分批停利委託"""
+        e_int = int(round(entry_price))
+        sl_int = int(round(sl_price))
+        tp_int = int(round(tp1_price))
+        
+        logger.info(f"🤖 [Shioaji 模擬下單觸發] 自動發起 2 口小台 {direction} 委託 | 限價: {e_int}, SL: {sl_int}, TP1: {tp_int}")
+        
+        if hasattr(self, 'api') and self.api is not None and hasattr(self, 'contract') and self.contract is None:
+            try:
+                act = sj.constant.Action.Buy if direction == "LONG" else sj.constant.Action.Sell
+                order = self.api.Order(
+                    action=act,
+                    price=e_int,
+                    quantity=2,  # 自動下單 2 口小台以利二階段分批停利
+                    order_type=sj.constant.OrderType.ROD,
+                    price_type=sj.constant.StockPriceType.LMT,
+                    market_type=sj.constant.MarketType.Future
+                )
+                trade = self.api.place_order(self.contract, order)
+                logger.signal(f"✅ [Shioaji 模擬帳戶下單成功] 交易單號: {trade.order.id}")
+            except Exception as e:
+                logger.error(f"❌ [Shioaji 模擬帳戶下單失敗]: {str(e)}")
