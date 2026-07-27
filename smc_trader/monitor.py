@@ -342,8 +342,8 @@ class LiveMonitor:
                             sl_price = entry_price - MAX_SL_POINTS
                             sl_points = MAX_SL_POINTS
                         
-                        # TP1 @ 2.0x RR 二階段分批停利第一目標
-                        tp1_price = entry_price + sl_points * 2.0
+                        # TP1 @ 3.0x RR 二階段分批停利第一目標 (經大數據回測驗證最優)
+                        tp1_price = entry_price + sl_points * 3.0
                         
                         p_int = int(round(price))
                         e_int = int(round(entry_price))
@@ -378,8 +378,8 @@ class LiveMonitor:
                             sl_price = entry_price + MAX_SL_POINTS
                             sl_points = MAX_SL_POINTS
                         
-                        # TP1 @ 2.0x RR 二階段分批停利第一目標
-                        tp1_price = entry_price - sl_points * 2.0
+                        # TP1 @ 3.0x RR 二階段分批停利第一目標 (經大數據回測驗證最優)
+                        tp1_price = entry_price - sl_points * 3.0
                         
                         p_int = int(round(price))
                         e_int = int(round(entry_price))
