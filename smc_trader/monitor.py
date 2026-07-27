@@ -317,30 +317,23 @@ class LiveMonitor:
         if has_signal:
             dt_str = last_bar['ts'].strftime('%Y-%m-%d %H:%M:%S')
             
-            # 動態計算交易建議與進場、停損、停利價格
+            # 動態計算交易建議與進場、停損、二階段停利價格
             is_bullish_signal = "bullish" in signal_tg_name.lower() or "sweep low" in signal_tg_name.lower() or "mss bullish" in signal_tg_name.lower() or "cisd bullish" in signal_tg_name.lower()
             is_bearish_signal = "bearish" in signal_tg_name.lower() or "sweep high" in signal_tg_name.lower() or "mss bearish" in signal_tg_name.lower() or "cisd bearish" in signal_tg_name.lower()
             
-            # 檢查過濾條件 (1. 建倉時間 restriction [已暫時移除], 2. 0.9x ATR 波動濾網)
-            bar_time = last_bar['ts'].time()
-            is_valid_time = True # 暫時移除時間限制，允許全時段接收監控通知
+            # 檢查過濾條件 (0.9x ATR 波動濾網)
             is_volatile = last_bar.get('is_volatile', True)
 
-            trade_advice = ""
-            if not is_volatile:
-                trade_advice = "❌ <b>建議交易</b>：無 (目前處於低波動盤整期，ATR 波動濾網攔截！)"
-            elif is_bullish_signal:
-                ob_low = last_bar['bullish_ob_low']
-                ob_high = last_bar['bullish_ob_high']
-                fvg_high = last_bar['bullish_fvg_high']
-                
-                entry_price = ob_high if not np.isnan(ob_high) else fvg_high
-                sl_price = ob_low if not np.isnan(ob_low) else (last_bar['confirmed_sl_1m'] if not np.isnan(last_bar['confirmed_sl_1m']) else last_bar['low'] - 15.0)
-                
-                if not np.isnan(entry_price) and not np.isnan(sl_price):
-                    if price <= sl_price:
-                        trade_advice = "❌ <b>建議交易</b>：無 (目前價格已跌破/觸及多頭停損點，多頭 OB 失效！)"
-                    else:
+            if is_volatile:
+                if is_bullish_signal:
+                    ob_low = last_bar['bullish_ob_low']
+                    ob_high = last_bar['bullish_ob_high']
+                    fvg_high = last_bar['bullish_fvg_high']
+                    
+                    entry_price = ob_high if not np.isnan(ob_high) else fvg_high
+                    sl_price = ob_low if not np.isnan(ob_low) else (last_bar['confirmed_sl_1m'] if not np.isnan(last_bar['confirmed_sl_1m']) else last_bar['low'] - 15.0)
+                    
+                    if not np.isnan(entry_price) and not np.isnan(sl_price) and price > sl_price:
                         sl_points = entry_price - sl_price
                         if sl_points <= 5.0:
                             sl_price = entry_price - 20.0
@@ -349,27 +342,33 @@ class LiveMonitor:
                             sl_price = entry_price - MAX_SL_POINTS
                             sl_points = MAX_SL_POINTS
                         
-                        tp_price = entry_price + sl_points * DEFAULT_RR
-                        trade_advice = (
-                            f"💡 <b>多頭策略建議掛單</b>：\n"
-                            f"  👉 <b>建議進場價 (限價買)</b>：<code>{entry_price:.1f}</code>\n"
-                            f"  🛑 <b>建議停損價 (SL)</b>：<code>{sl_price:.1f}</code> (風險: {sl_points:.1f} 點)\n"
-                            f"  🎯 <b>建議停利價 (TP)</b>：<code>{tp_price:.1f}</code> (預估利潤: {sl_points*DEFAULT_RR:.1f} 點, R:R={DEFAULT_RR})"
+                        # TP1 @ 2.0x RR 二階段分批停利第一目標
+                        tp1_price = entry_price + sl_points * 2.0
+                        
+                        p_int = int(round(price))
+                        e_int = int(round(entry_price))
+                        sl_int = int(round(sl_price))
+                        tp_int = int(round(tp1_price))
+                        
+                        tg_text = (
+                            f"觸發時間：{dt_str}\n"
+                            f"最新價格：{p_int}\n"
+                            f"大結構趨勢 (5M)：{trend_5m}\n"
+                            f"🚨 訊號類型：{signal_tg_name}\n"
+                            f"💡 多單限價買：{e_int} | SL：{sl_int}  | TP：{tp_int}"
                         )
-                else:
-                    trade_advice = "❌ <b>建議交易</b>：無 (未檢測到有效的多頭 OB / FVG 區間)"
-            elif is_bearish_signal:
-                ob_low = last_bar['bearish_ob_low']
-                ob_high = last_bar['bearish_ob_high']
-                fvg_low = last_bar['bearish_fvg_low']
-                
-                entry_price = ob_low if not np.isnan(ob_low) else fvg_low
-                sl_price = ob_high if not np.isnan(ob_high) else (last_bar['confirmed_sh_1m'] if not np.isnan(last_bar['confirmed_sh_1m']) else last_bar['high'] + 15.0)
-                
-                if not np.isnan(entry_price) and not np.isnan(sl_price):
-                    if price >= sl_price:
-                        trade_advice = "❌ <b>建議交易</b>：無 (目前價格已漲破/觸及空頭停損點，空頭 OB 失效！)"
-                    else:
+                        logger.signal(f"訊號觸發，發送 Telegram 精簡通知: {signal_tg_name}")
+                        send_telegram_notification(tg_text)
+                        
+                elif is_bearish_signal:
+                    ob_low = last_bar['bearish_ob_low']
+                    ob_high = last_bar['bearish_ob_high']
+                    fvg_low = last_bar['bearish_fvg_low']
+                    
+                    entry_price = ob_low if not np.isnan(ob_low) else fvg_low
+                    sl_price = ob_high if not np.isnan(ob_high) else (last_bar['confirmed_sh_1m'] if not np.isnan(last_bar['confirmed_sh_1m']) else last_bar['high'] + 15.0)
+                    
+                    if not np.isnan(entry_price) and not np.isnan(sl_price) and price < sl_price:
                         sl_points = sl_price - entry_price
                         if sl_points <= 5.0:
                             sl_price = entry_price + 20.0
@@ -378,33 +377,20 @@ class LiveMonitor:
                             sl_price = entry_price + MAX_SL_POINTS
                             sl_points = MAX_SL_POINTS
                         
-                        tp_price = entry_price - sl_points * DEFAULT_RR
-                        trade_advice = (
-                            f"💡 <b>空頭策略建議掛單</b>：\n"
-                            f"  👉 <b>建議進場價 (限價賣)</b>：<code>{entry_price:.1f}</code>\n"
-                            f"  🛑 <b>建議停損價 (SL)</b>：<code>{sl_price:.1f}</code> (風險: {sl_points:.1f} 點)\n"
-                            f"  🎯 <b>建議停利價 (TP)</b>：<code>{tp_price:.1f}</code> (預估利潤: {sl_points*DEFAULT_RR:.1f} 點, R:R={DEFAULT_RR})"
+                        # TP1 @ 2.0x RR 二階段分批停利第一目標
+                        tp1_price = entry_price - sl_points * 2.0
+                        
+                        p_int = int(round(price))
+                        e_int = int(round(entry_price))
+                        sl_int = int(round(sl_price))
+                        tp_int = int(round(tp1_price))
+                        
+                        tg_text = (
+                            f"觸發時間：{dt_str}\n"
+                            f"最新價格：{p_int}\n"
+                            f"大結構趨勢 (5M)：{trend_5m}\n"
+                            f"🚨 訊號類型：{signal_tg_name}\n"
+                            f"💡 空單限價賣：{e_int} | SL：{sl_int}  | TP：{tp_int}"
                         )
-                else:
-                    trade_advice = "❌ <b>建議交易</b>：無 (未檢測到有效的空頭 OB / FVG 區間)"
-            
-            tg_text = (
-                f"<b>🔔 SMC 交易訊號觸發通知</b>\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"<b>商品標的</b>：台指期近月 (TXFR1)\n"
-                f"<b>觸發時間</b>：{dt_str}\n"
-                f"<b>最新價格</b>：<code>{price}</code>\n"
-                f"<b>大結構趨勢 (5M)</b>：<b>{trend_5m}</b>\n\n"
-                f"🚨 <b>訊號類型</b>：<b>{signal_tg_name}</b>\n\n"
-                f"🟢 多頭 OB：{bull_ob}\n"
-                f"🔴 空頭 OB：{bear_ob}\n"
-                f"🟢 多頭 FVG：{bull_fvg}\n"
-                f"🔴 空頭 FVG：{bear_fvg}\n\n"
-                f"{trade_advice}\n"
-            )
-            # 只有在有明確建議掛單（非垃圾/失效訊息）時才發送 Telegram 通知
-            if "💡" in trade_advice:
-                logger.signal(f"訊號觸發，發送 Telegram 通知: {signal_tg_name}")
-                send_telegram_notification(tg_text)
-            else:
-                logger.info(f"[過濾] 偵測到信號但建議無效，已跳過發送 Telegram 通知。")
+                        logger.signal(f"訊號觸發，發送 Telegram 精簡通知: {signal_tg_name}")
+                        send_telegram_notification(tg_text)
