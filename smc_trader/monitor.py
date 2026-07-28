@@ -164,6 +164,13 @@ class LiveMonitor:
 
         api.quote.subscribe(contract, quote_type=sj.constant.QuoteType.Tick)
         
+        # 訂閱完成後，立刻先分析並輸出當前歷史基礎點位
+        logger.info(f"{C_GREEN}訂閱成功！正在進行初始 SMC 結構運算...{C_RESET}")
+        try:
+            self._analyze_and_print_state()
+        except Exception as e:
+            logger.warning(f"初始 SMC 運算提醒: {str(e)}")
+
         # 保持執行
         try:
             while True:
@@ -197,8 +204,20 @@ class LiveMonitor:
         except KeyboardInterrupt:
             logger.info(f"模擬監控已手動終止。")
 
-    def _process_new_tick(self, price: float, vol: int, dt: datetime.datetime):
+    def _process_new_tick(self, price: float, vol: int, dt: Any):
         """處理傳入的即時報價並合建成 K 線"""
+        # 確保 dt 統一轉為 datetime 物件
+        if isinstance(dt, str):
+            dt = pd.to_datetime(dt).to_pydatetime()
+        elif hasattr(dt, 'to_pydatetime'):
+            dt = dt.to_pydatetime()
+        elif not isinstance(dt, datetime.datetime):
+            dt = datetime.datetime.now()
+            
+        # 去除時區屬性以利安全計算時間差
+        if dt.tzinfo is not None:
+            dt = dt.replace(tzinfo=None)
+
         # 模擬模式下，1M K 線加速為 10 秒
         time_step = 10 if self.mode == "mock" else 60
         
@@ -212,20 +231,29 @@ class LiveMonitor:
                 'close': price,
                 'volume': vol
             }
+            logger.info(f"⚡ [開始新 K 線] {dt.strftime('%H:%M:%S')} | 成交價: {C_BOLD}{price}{C_RESET} | 量: {vol}")
         else:
             cb = self.current_bar_1m
-            # 檢查時間差是否達到一個 K 線週期
+            # 檢查時間差是否達到一個 K 線週期 (60秒或分鐘換棒)
             time_diff = (dt - cb['ts']).total_seconds()
-            if time_diff < time_step:
+            
+            # 若已經跨到新的一分鐘 (例如 19:32 跨到 19:33) 或滿 60 秒
+            is_new_minute = (dt.minute != cb['ts'].minute) or (time_diff >= time_step)
+            
+            if not is_new_minute:
                 # 更新當前 K 線
                 cb['high'] = max(cb['high'], price)
                 cb['low'] = min(cb['low'], price)
                 cb['close'] = price
                 cb['volume'] += vol
+                # 印出即時報價滾動 log
+                ts_str = dt.strftime('%H:%M:%S')
+                print(f"\r⚡ [即時報價] {ts_str} | 現價: {price:.1f} | 單量: {vol} | K線 (高:{cb['high']:.1f} 低:{cb['low']:.1f})", end="", flush=True)
             else:
+                print("\n") # 換行
                 # 將當前 K 線歸檔到歷史中
                 self.history_1m.append(cb)
-                if len(self.history_1m) > 2000: # 擴大長度限制至 2000 根以容納更多 Swing 歷史
+                if len(self.history_1m) > 2000:
                     self.history_1m.pop(0)
                 
                 # 開啟新的一根 K 線
@@ -237,6 +265,9 @@ class LiveMonitor:
                     'close': price,
                     'volume': vol
                 }
+                
+                # 換棒時，進行最新 SMC 特徵檢測並輸出螢幕與 Telegram！
+                self._analyze_and_print_state()
 
     def _analyze_and_print_state(self):
         """對當前歷史 K 線數據進行 SMC 特徵辨識，並精美輸出"""
