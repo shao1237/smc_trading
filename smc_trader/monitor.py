@@ -506,24 +506,25 @@ class LiveMonitor:
         dir_label = "多單限價買" if direction == "LONG" else "空單限價賣"
 
         if pos is None:
-            # 目前無持倉，正常開新倉
+            # 目前無持倉，正常開新倉 (3星3口，其他2口)
+            lots = 3 if signal_level == 3 else 2
             tg_text = (
                 f"觸發時間：{dt_str}\n"
                 f"最新價格：{p_int}\n"
                 f"大結構趨勢 (5M)：{trend_5m}\n"
                 f"🚨 訊號類型：{signal_tg_name}\n"
-                f"💡 {dir_label}：{e_int} | SL：{sl_int}  | TP：{tp_int}"
+                f"💡 {dir_label} ({lots}口)：{e_int} | SL：{sl_int}  | TP：{tp_int}"
             )
             send_telegram_notification(tg_text, chat_id=TELEGRAM_SIGNAL_CHAT_ID)
-            self._place_simulated_2stage_order(direction, entry_price, sl_price, tp1_price, signal_level=signal_level, lots=2)
+            self._place_simulated_2stage_order(direction, entry_price, sl_price, tp1_price, signal_level=signal_level, lots=lots)
             return
 
-        # 已有持倉：唯一允許覆蓋的組合是「目前持倉為 1★ 開倉、且本次新訊號為 2★」
-        if pos.get('signal_level') == 1 and signal_level == 2:
+        # 已有持倉：允許較高星級的新訊號覆蓋較低星級的持倉 (例如 2★ 蓋 1★，或 3★ 蓋 1★/2★)
+        if pos.get('signal_level', 1) < signal_level:
             if direction == pos['direction']:
-                self._add_on_position(direction, signal_tg_name, entry_price, sl_price, tp1_price, dt_str)
+                self._add_on_position(direction, signal_tg_name, entry_price, sl_price, tp1_price, dt_str, signal_level)
             else:
-                self._reverse_position(direction, signal_tg_name, entry_price, sl_price, tp1_price, dt_str, price)
+                self._reverse_position(direction, signal_tg_name, entry_price, sl_price, tp1_price, dt_str, price, signal_level)
             return
 
         # 其他所有情況：已持倉就不開新倉
@@ -537,10 +538,13 @@ class LiveMonitor:
         send_telegram_notification(skip_text, chat_id=TELEGRAM_SIGNAL_CHAT_ID)
 
     def _add_on_position(self, direction: str, signal_tg_name: str, entry_price: float,
-                          sl_price: float, tp1_price: float, dt_str: str):
-        """2★ 訊號同方向覆蓋 1★ 持倉：加碼 1 口，套用新訊號的 SL/TP1。"""
+                          sl_price: float, tp1_price: float, dt_str: str, signal_level: int):
+        """高星級訊號同方向覆蓋低星級持倉：加碼口數，套用新訊號的 SL/TP1。"""
         pos = self.active_position
-        add_lots = 1
+        
+        target_lots = 3 if signal_level == 3 else 2
+        current_base_lots = pos.get('lots', 2)
+        add_lots = max(1, target_lots - current_base_lots)
 
         if pos.get('stage') == 2:
             # 原持倉已過 TP1、剩餘部位保本續抱中：把加碼口數併入剩餘部位，
@@ -560,16 +564,16 @@ class LiveMonitor:
         sl_int = int(round(sl_price))
         tp_int = int(round(tp1_price))
 
-        logger.signal(f"🔼 [2★訊號加倉] {direction} 同方向加碼 {add_lots} 口（{old_lots}→{new_lots} 口），套用新 SL/TP1")
+        logger.signal(f"🔼 [{signal_level}★訊號加倉] {direction} 同方向加碼 {add_lots} 口（{old_lots}→{new_lots} 口），套用新 SL/TP1")
 
         pos['lots'] = new_lots
         pos['sl'] = sl_price
         pos['tp1'] = tp1_price
-        pos['signal_level'] = 2  # 持倉升級為 2★
+        pos['signal_level'] = signal_level  # 持倉升級
 
         remain_note = f"下次 TP1 將平 {preview_close} 口、留 {preview_remain} 口續抱" if preview_remain > 0 else f"下次 TP1 將全部 {preview_close} 口出場"
         msg = (
-            f"🔼 <b>[SMC 加倉通知 - 2★訊號覆蓋1★持倉]</b>\n"
+            f"🔼 <b>[SMC 加倉通知 - {signal_level}★訊號覆蓋持倉]</b>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"<b>觸發時間</b>：{dt_str}\n"
             f"<b>訊號類型</b>：{signal_tg_name}\n"
@@ -596,8 +600,8 @@ class LiveMonitor:
                 logger.error(f"❌ [Shioaji 加碼下單失敗]: {str(e)}")
 
     def _reverse_position(self, new_direction: str, signal_tg_name: str, entry_price: float,
-                           sl_price: float, tp1_price: float, dt_str: str, current_price: float):
-        """2★ 訊號反方向覆蓋 1★ 持倉：先以目前市價強制平倉舊部位，再反向開 1 口新倉。"""
+                           sl_price: float, tp1_price: float, dt_str: str, current_price: float, signal_level: int):
+        """高星級訊號反方向覆蓋低星級持倉：先以目前市價強制平倉舊部位，再反向開新倉。"""
         pos = self.active_position
         # 若已過 TP1（stage 2），實際剩餘口數是 remaining_lots；否則是完整 lots
         lots = pos.get('remaining_lots', pos.get('lots', 2)) if pos.get('stage') == 2 else pos.get('lots', 2)
@@ -608,23 +612,24 @@ class LiveMonitor:
 
         close_dir_label = "多單 (LONG)" if pos['direction'] == 'LONG' else "空單 (SHORT)"
         msg = (
-            f"🔄 <b>[SMC 模擬單平倉戰報 - 2★訊號反向覆蓋1★持倉]</b>\n"
+            f"🔄 <b>[SMC 模擬單平倉戰報 - {signal_level}★訊號反向覆蓋持倉]</b>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"<b>原交易方向</b>：{close_dir_label}（{lots} 口）\n"
             f"<b>平倉時間</b>：{dt_str}\n"
-            f"<b>平倉原因</b>：🔄 偵測到反方向 2★ 訊號（{signal_tg_name}），強制平倉反手\n\n"
+            f"<b>平倉原因</b>：🔄 偵測到反方向 {signal_level}★ 訊號（{signal_tg_name}），強制平倉反手\n\n"
             f"<b>進場價格</b>：<code>{int(round(pos['entry_price']))}</code>\n"
             f"<b>平倉價格</b>：<code>{int(round(current_price))}</code>\n"
             f"<b>本次盈虧</b>：<code>{net_pnl:+,.0f} NTD</code>\n\n"
             f"🏆 <b>該單累積總損益</b>：<code>{tot_pnl:+,.0f} NTD</code>"
         )
-        logger.signal(f"🔄 2★訊號反向覆蓋 1★ 持倉，強制平倉並反手：{tot_pnl:+,.0f} NTD")
+        logger.signal(f"🔄 {signal_level}★訊號反向覆蓋持倉，強制平倉並反手：{tot_pnl:+,.0f} NTD")
         send_telegram_notification(msg, chat_id=TELEGRAM_SETTLEMENT_CHAT_ID)
 
         self.active_position = None
 
-        # 平倉後立刻反向開 1 口新倉（非標準 2 口 / 2 階段停利模型）
-        self._place_simulated_2stage_order(new_direction, entry_price, sl_price, tp1_price, signal_level=2, lots=1)
+        # 平倉後立刻反向開新倉
+        new_lots = 3 if signal_level == 3 else 2
+        self._place_simulated_2stage_order(new_direction, entry_price, sl_price, tp1_price, signal_level=signal_level, lots=new_lots)
 
     def _place_simulated_2stage_order(self, direction: str, entry_price: float, sl_price: float,
                                        tp1_price: float, signal_level: int = 1, lots: int = 2):
