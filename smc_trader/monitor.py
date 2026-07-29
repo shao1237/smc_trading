@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import math
 import datetime
 import numpy as np
 import pandas as pd
@@ -9,7 +10,8 @@ from typing import List, Dict, Any, Optional
 from smc_trader.config import (
     SHIOAJI_API_KEY, SHIOAJI_SECRET_KEY, SHIOAJI_SIMULATION,
     SWING_WINDOW_5M, SWING_WINDOW_1M, VOLUME_MA_PERIOD, VOLUME_MULT,
-    DEFAULT_RR, MAX_SL_POINTS, TELEGRAM_SIGNAL_CHAT_ID, TELEGRAM_SETTLEMENT_CHAT_ID
+    DEFAULT_RR, MAX_SL_POINTS, TELEGRAM_SIGNAL_CHAT_ID, TELEGRAM_SETTLEMENT_CHAT_ID,
+    SLIPPAGE_POINTS, COMMISSION_FEE
 )
 from smc_trader.smc_detector import SMCDetector
 from smc_trader.telegram_sender import send_telegram_notification
@@ -23,6 +25,20 @@ C_BLUE = "\033[94m"
 C_CYAN = "\033[96m"
 C_BOLD = "\033[1m"
 C_RESET = "\033[0m"
+
+# [FIX] 模擬持倉損益計算常數。
+# config.py 的 FUTURES_POINT_VALUE(200.0)是給「大台」用的，
+# 但本檔案下單/log 訊息用的是「小台 (MTX)」(見 _place_simulated_2stage_order 的 log 文字)，
+# 小台每口每點 50 NTD，故獨立定義，不直接沿用 FUTURES_POINT_VALUE。
+MINI_POINT_VALUE = 50.0
+
+# config.py 的 SLIPPAGE_POINTS / COMMISSION_FEE 註解皆為「單邊」，來回各要乘以 2。
+# 原本 monitor.py 的舊公式用的是「-2.0 點」與「-100 元」，
+# 那其實只等於單邊滑價(2點)、和單口單邊成本的 2 倍(=來回100元/口)，
+# 且完全沒有依口數縮放 —— 也就是說，就算原本標榜的是「2 口」，
+# PnL 數字實際上一直只是照 1 口去算的。這裡統一改成正確依口數縮放。
+ROUNDTRIP_SLIPPAGE_PTS = SLIPPAGE_POINTS * 2       # 來回滑價點數
+ROUNDTRIP_COMMISSION_PER_LOT = COMMISSION_FEE * 2  # 每口來回手續費 (NTD)
 
 logger = get_logger()
 
@@ -45,10 +61,24 @@ class LiveMonitor:
         
         # 歷史 1M K 線數據庫
         self.history_1m: List[Dict[str, Any]] = []
-        
+
+        # 當前進行中的 1M K 線
+        # [FIX] 此屬性曾在 commit 86fb853 被誤刪，導致 on_tick 首次觸發時
+        # 直接丟出 AttributeError（且該例外會被 Shioaji 背景執行緒吃掉，
+        # 表面上完全看不出來，只會呈現「訂閱成功後就不再有任何 tick 更新」）。
+        self.current_bar_1m: Optional[Dict[str, Any]] = None
+
         # 當前模擬/實盤持倉追蹤 (二階段停利與保本管理)
         self.active_position: Optional[Dict[str, Any]] = None
-        
+
+        # 最近一次收到 tick 的時間，供健康檢查（多久沒收到報價）使用
+        self.last_tick_time: Optional[datetime.datetime] = None
+
+        # Shioaji API / 合約物件；於 _run_shioaji() 中實際賦值，
+        # 供 _place_simulated_2stage_order() 送出模擬單使用
+        self.api: Optional[Any] = None
+        self.contract: Optional[Any] = None
+
         # 預先載入一部分歷史數據以讓 Swing Points 能夠在初始時就能被計算
         self._init_history()
 
@@ -147,7 +177,14 @@ class LiveMonitor:
             
         if contract is None:
             raise ValueError("找不到 TXFR1 期貨合約")
-        
+
+        # [FIX] 原本 api / contract 僅為區域變數，_place_simulated_2stage_order()
+        # 內部的 hasattr(self, 'api') 永遠是 False，導致「自動模擬下單」功能
+        # 從 commit c78a8b7 導入以來從未真正執行過，只印了 log、發了 Telegram，
+        # 沒有任何委託送出。這裡補上綁定。
+        self.api = api
+        self.contract = contract
+
         logger.info(f"{C_GREEN}訂閱商品: {contract.code} - {contract.name}{C_RESET}")
         logger.info(f"{C_YELLOW}開始接收即時報價，按下 Ctrl+C 結束監控。{C_RESET}")
         logger.info("=" * 60)
@@ -156,25 +193,46 @@ class LiveMonitor:
         def on_tick(exchange, tick):
             # 處理即時 Tick
             # tick 包含：close, volume, datetime 等
-            price = float(tick.close)
-            vol = int(tick.volume)
-            dt = tick.datetime # 格式通常為 datetime 物件
-            
-            self._process_new_tick(price, vol, dt)
+            # [FIX] 這裡原本完全沒有 try/except。Shioaji 是在自己的背景執行緒
+            # 呼叫這個 callback，任何未被攔截的例外都會被該執行緒吞掉、
+            # 不會顯示在畫面或 log 上 —— 這正是這次「畫面停在訂閱成功、
+            # 之後完全沒有 tick 更新」卻沒有任何錯誤訊息的根本原因。
+            # 加上例外處理後，未來若再出問題，至少 log 檔會留下 traceback。
+            try:
+                price = float(tick.close)
+                vol = int(tick.volume)
+                dt = tick.datetime  # 格式通常為 datetime 物件
+                self._process_new_tick(price, vol, dt)
+            except Exception as e:
+                logger.exception(f"處理即時 Tick 時發生例外，本筆 tick 已略過: {e}")
 
         api.quote.subscribe(contract, quote_type=sj.constant.QuoteType.Tick)
-        
+
         # 訂閱完成後，立刻先分析並輸出當前歷史基礎點位
+        # [FIX] trigger_actions=False：這裡用的是啟動時載入的「快取歷史資料」
+        # （很可能是幾天前的舊資料），只用來印出目前結構狀態方便確認基礎是否正確，
+        # 不應該用它來判斷訊號、發 Telegram 通知或觸發模擬下單，
+        # 否則每次啟動都可能因為快取最後一根舊 K 線恰好符合條件，
+        # 送出一筆用「舊時間戳、舊價位」產生的誤導性即時訊號。
         logger.info(f"{C_GREEN}訂閱成功！正在進行初始 SMC 結構運算...{C_RESET}")
         try:
-            self._analyze_and_print_state()
+            self._analyze_and_print_state(trigger_actions=False)
         except Exception as e:
             logger.warning(f"初始 SMC 運算提醒: {str(e)}")
 
-        # 保持執行
+        # 保持執行，並定期檢查是否已經一段時間沒收到任何 tick（斷線/清淡時段提醒）
+        HEARTBEAT_WARN_SECONDS = 60
+        last_warned = False
         try:
             while True:
                 time.sleep(1)
+                if self.last_tick_time is not None:
+                    idle = (datetime.datetime.now() - self.last_tick_time).total_seconds()
+                    if idle >= HEARTBEAT_WARN_SECONDS and not last_warned:
+                        logger.warning(f"⚠️ 已經 {int(idle)} 秒沒有收到任何即時報價，請確認連線 / 是否為非交易時段。")
+                        last_warned = True
+                    elif idle < HEARTBEAT_WARN_SECONDS:
+                        last_warned = False
         except KeyboardInterrupt:
             logger.info(f"監控已手動終止。")
             api.logout()
@@ -217,6 +275,18 @@ class LiveMonitor:
         # 去除時區屬性以利安全計算時間差
         if dt.tzinfo is not None:
             dt = dt.replace(tzinfo=None)
+
+        # 供主迴圈健康檢查使用：只要有進到這裡就代表確實收到報價
+        self.last_tick_time = datetime.datetime.now()
+
+        # [FIX] 防止斷線重連或延遲補送時，收到「時間戳早於目前這根K棒起始時間」的
+        # 亂序 tick。若不擋掉，append 進 history_1m 後 ts 不再單調遞增，
+        # 之後 _analyze_and_print_state() 裡的 df_1m.resample(on='ts') 會直接
+        # 拋出 ValueError（而這個例外目前只在 on_tick 內被記錄、不會讓程式當掉，
+        # 但該筆之後的分析會整個失敗）。
+        if self.current_bar_1m is not None and dt < self.current_bar_1m['ts']:
+            logger.warning(f"⚠️ 收到時間倒退的 tick（{dt.strftime('%H:%M:%S.%f')} 早於目前 K 線 {self.current_bar_1m['ts'].strftime('%H:%M:%S.%f')}），已略過。")
+            return
 
         # 模擬模式下，1M K 線加速為 10 秒
         time_step = 10 if self.mode == "mock" else 60
@@ -269,8 +339,14 @@ class LiveMonitor:
                 # 換棒時，進行最新 SMC 特徵檢測並輸出螢幕與 Telegram！
                 self._analyze_and_print_state()
 
-    def _analyze_and_print_state(self):
-        """對當前歷史 K 線數據進行 SMC 特徵辨識，並精美輸出"""
+    def _analyze_and_print_state(self, trigger_actions: bool = True):
+        """對當前歷史 K 線數據進行 SMC 特徵辨識，並精美輸出
+
+        Args:
+            trigger_actions: 是否允許本次分析觸發持倉結算、Telegram 訊號通知與模擬下單。
+                訂閱成功後、尚未收到任何真實 tick 前的「初始結構運算」應傳入 False，
+                因為那時 history_1m 只有啟動時載入的舊快取資料，不該被當成即時訊號來源。
+        """
         df_1m = pd.DataFrame(self.history_1m)
         
         rule = '50s' if self.mode == "mock" else '5min'
@@ -292,11 +368,13 @@ class LiveMonitor:
         price = last_bar['close']
         trend_5m = last_bar['trend_5m']
 
-        # 即時追蹤持倉是否平倉並發送 Telegram 戰報
-        self._check_position_settlement(last_bar)
+        # 即時追蹤持倉是否平倉並發送 Telegram 戰報（初始運算不觸發）
+        if trigger_actions:
+            self._check_position_settlement(last_bar)
 
         # 檢測是否有特殊信號
         has_signal = False
+        signal_level = 0  # 1=Sweep, 2=MSS, 3=CISD（★ 星級）
         signal_tg_name = ""
         signal_str = f"{C_BOLD}無特殊信號{C_RESET}"
         
@@ -304,26 +382,32 @@ class LiveMonitor:
             signal_str = f"{C_GREEN}{C_BOLD}★ [流動性掠奪] Sweep Low 形成！(買方防守){C_RESET}"
             signal_tg_name = "★ [流動性掠奪] Sweep Low 形成 (多頭訊號)！"
             has_signal = True
+            signal_level = 1
         elif last_bar['sweep_high']:
             signal_str = f"{C_RED}{C_BOLD}★ [流動性掠奪] Sweep High 形成！(賣方防守){C_RESET}"
             signal_tg_name = "★ [流動性掠奪] Sweep High 形成 (空頭訊號)！"
             has_signal = True
+            signal_level = 1
         elif last_bar['mss_bullish']:
             signal_str = f"{C_GREEN}{C_BOLD}★★ [結構轉換] MSS Bullish 確立！趨勢轉多{C_RESET}"
             signal_tg_name = "★★ [結構轉換] MSS Bullish 確立 (多頭訊號)！"
             has_signal = True
+            signal_level = 2
         elif last_bar['mss_bearish']:
             signal_str = f"{C_RED}{C_BOLD}★★ [結構轉換] MSS Bearish 確立！趨勢轉空{C_RESET}"
             signal_tg_name = "★★ [結構轉換] MSS Bearish 確立 (空頭訊號)！"
             has_signal = True
+            signal_level = 2
         elif last_bar['cisd_bullish']:
             signal_str = f"{C_GREEN}{C_BOLD}★★★ [價格交付改變] CISD Bullish 爆量突破對立 OB！{C_RESET}"
             signal_tg_name = "★★★ [價格交付改變] CISD Bullish 爆量突破 (多頭訊號)！"
             has_signal = True
+            signal_level = 3
         elif last_bar['cisd_bearish']:
             signal_str = f"{C_RED}{C_BOLD}★★★ [價格交付改變] CISD Bearish 爆量跌破對立 OB！{C_RESET}"
             signal_tg_name = "★★★ [價格交付改變] CISD Bearish 爆量跌破 (空頭訊號)！"
             has_signal = True
+            signal_level = 3
 
         # 取得當前 OB / FVG 區間
         bull_ob = f"[{last_bar['bullish_ob_low']} - {last_bar['bullish_ob_high']}]" if not np.isnan(last_bar['bullish_ob_low']) else "無"
@@ -341,8 +425,11 @@ class LiveMonitor:
         logger.info(f"       多頭 FVG : {C_GREEN}{bull_fvg}{C_RESET} | 空頭 FVG : {C_RED}{bear_fvg}{C_RESET}")
         logger.info("-" * 70)
 
-        # 發送 Telegram 通知
-        if has_signal:
+        # 發送 Telegram 通知（初始運算只印出結構狀態，不觸發通知/下單）
+        if has_signal and not trigger_actions:
+            logger.info(f"       （初始結構運算偵測到訊號條件，但因使用舊快取資料，已略過通知與下單）")
+
+        if has_signal and trigger_actions:
             dt_str = last_bar['ts'].strftime('%Y-%m-%d %H:%M:%S')
             
             # 動態計算交易建議與進場、停損、二階段停利價格
@@ -373,21 +460,8 @@ class LiveMonitor:
                         # TP1 @ 3.0x RR 二階段分批停利第一目標 (經大數據回測驗證最優)
                         tp1_price = entry_price + sl_points * 3.0
                         
-                        p_int = int(round(price))
-                        e_int = int(round(entry_price))
-                        sl_int = int(round(sl_price))
-                        tp_int = int(round(tp1_price))
-                        
-                        tg_text = (
-                            f"觸發時間：{dt_str}\n"
-                            f"最新價格：{p_int}\n"
-                            f"大結構趨勢 (5M)：{trend_5m}\n"
-                            f"🚨 訊號類型：{signal_tg_name}\n"
-                            f"💡 多單限價買：{e_int} | SL：{sl_int}  | TP：{tp_int}"
-                        )
                         logger.signal(f"訊號觸發，發送 Telegram 即時監控通知 (ID: {TELEGRAM_SIGNAL_CHAT_ID}): {signal_tg_name}")
-                        send_telegram_notification(tg_text, chat_id=TELEGRAM_SIGNAL_CHAT_ID)
-                        self._place_simulated_2stage_order("LONG", entry_price, sl_price, tp1_price)
+                        self._handle_signal_action("LONG", signal_level, signal_tg_name, entry_price, sl_price, tp1_price, price, dt_str, trend_5m)
                         
                 elif is_bearish_signal:
                     ob_low = last_bar['bearish_ob_low']
@@ -409,29 +483,162 @@ class LiveMonitor:
                         # TP1 @ 3.0x RR 二階段分批停利第一目標 (經大數據回測驗證最優)
                         tp1_price = entry_price - sl_points * 3.0
                         
-                        p_int = int(round(price))
-                        e_int = int(round(entry_price))
-                        sl_int = int(round(sl_price))
-                        tp_int = int(round(tp1_price))
-                        
-                        tg_text = (
-                            f"觸發時間：{dt_str}\n"
-                            f"最新價格：{p_int}\n"
-                            f"大結構趨勢 (5M)：{trend_5m}\n"
-                            f"🚨 訊號類型：{signal_tg_name}\n"
-                            f"💡 空單限價賣：{e_int} | SL：{sl_int}  | TP：{tp_int}"
-                        )
                         logger.signal(f"訊號觸發，發送 Telegram 即時監控通知 (ID: {TELEGRAM_SIGNAL_CHAT_ID}): {signal_tg_name}")
-                        send_telegram_notification(tg_text, chat_id=TELEGRAM_SIGNAL_CHAT_ID)
-                        self._place_simulated_2stage_order("SHORT", entry_price, sl_price, tp1_price)
+                        self._handle_signal_action("SHORT", signal_level, signal_tg_name, entry_price, sl_price, tp1_price, price, dt_str, trend_5m)
 
-    def _place_simulated_2stage_order(self, direction: str, entry_price: float, sl_price: float, tp1_price: float):
-        """透過 Shioaji 模擬環境自動送出 2 口小台 (TXFR1) 限價進場與二階段分批停利委託"""
+    def _handle_signal_action(self, direction: str, signal_level: int, signal_tg_name: str,
+                               entry_price: float, sl_price: float, tp1_price: float,
+                               price: float, dt_str: str, trend_5m: str):
+        """
+        依「目前持倉狀態」與「新訊號星級」決定動作：
+        - 沒有持倉：正常開新倉（2 口 / 2 階段停利，維持原邏輯）
+        - 已有持倉，且持倉是 1★ 訊號開的、本次新訊號是 2★：允許覆蓋
+            - 同方向：加碼 1 口，套用新訊號的 SL/TP1
+            - 反方向：先以目前市價強制平倉，再反向開 1 口新倉
+        - 其他所有情況（含 3★ 想蓋 1★、任何訊號想蓋 2★/3★ 持倉）：
+          已持倉就不開新倉，Telegram 顯示「已持倉不開新倉」
+        """
+        pos = self.active_position
+        p_int = int(round(price))
+        e_int = int(round(entry_price))
+        sl_int = int(round(sl_price))
+        tp_int = int(round(tp1_price))
+        dir_label = "多單限價買" if direction == "LONG" else "空單限價賣"
+
+        if pos is None:
+            # 目前無持倉，正常開新倉
+            tg_text = (
+                f"觸發時間：{dt_str}\n"
+                f"最新價格：{p_int}\n"
+                f"大結構趨勢 (5M)：{trend_5m}\n"
+                f"🚨 訊號類型：{signal_tg_name}\n"
+                f"💡 {dir_label}：{e_int} | SL：{sl_int}  | TP：{tp_int}"
+            )
+            send_telegram_notification(tg_text, chat_id=TELEGRAM_SIGNAL_CHAT_ID)
+            self._place_simulated_2stage_order(direction, entry_price, sl_price, tp1_price, signal_level=signal_level, lots=2)
+            return
+
+        # 已有持倉：唯一允許覆蓋的組合是「目前持倉為 1★ 開倉、且本次新訊號為 2★」
+        if pos.get('signal_level') == 1 and signal_level == 2:
+            if direction == pos['direction']:
+                self._add_on_position(direction, signal_tg_name, entry_price, sl_price, tp1_price, dt_str)
+            else:
+                self._reverse_position(direction, signal_tg_name, entry_price, sl_price, tp1_price, dt_str, price)
+            return
+
+        # 其他所有情況：已持倉就不開新倉
+        logger.info(f"⏸️ 已持倉中（{pos['direction']}／{pos.get('signal_level', '?')}★開倉），偵測到 {signal_level}★ 新訊號但不符合覆蓋條件，略過本次訊號。")
+        skip_text = (
+            f"觸發時間：{dt_str}\n"
+            f"最新價格：{p_int}\n"
+            f"🚨 訊號類型：{signal_tg_name}\n"
+            f"⏸️ 已持倉不開新倉"
+        )
+        send_telegram_notification(skip_text, chat_id=TELEGRAM_SIGNAL_CHAT_ID)
+
+    def _add_on_position(self, direction: str, signal_tg_name: str, entry_price: float,
+                          sl_price: float, tp1_price: float, dt_str: str):
+        """2★ 訊號同方向覆蓋 1★ 持倉：加碼 1 口，套用新訊號的 SL/TP1。"""
+        pos = self.active_position
+        add_lots = 1
+
+        if pos.get('stage') == 2:
+            # 原持倉已過 TP1、剩餘部位保本續抱中：把加碼口數併入剩餘部位，
+            # 並用新訊號的 SL/TP1 重新展開一輪停利週期（stage 重設為 1）。
+            # 先前 TP1 那筆已落袋的損益 (pnl_stage1) 予以保留，最終結算時會一併加總。
+            old_lots = pos.get('remaining_lots', pos.get('lots', 2))
+            pos['stage'] = 1
+            pos.pop('remaining_lots', None)
+        else:
+            old_lots = pos.get('lots', 2)
+
+        new_lots = old_lots + add_lots
+        preview_close = math.ceil(new_lots / 2)
+        preview_remain = new_lots - preview_close
+
+        e_int = int(round(entry_price))
+        sl_int = int(round(sl_price))
+        tp_int = int(round(tp1_price))
+
+        logger.signal(f"🔼 [2★訊號加倉] {direction} 同方向加碼 {add_lots} 口（{old_lots}→{new_lots} 口），套用新 SL/TP1")
+
+        pos['lots'] = new_lots
+        pos['sl'] = sl_price
+        pos['tp1'] = tp1_price
+        pos['signal_level'] = 2  # 持倉升級為 2★
+
+        remain_note = f"下次 TP1 將平 {preview_close} 口、留 {preview_remain} 口續抱" if preview_remain > 0 else f"下次 TP1 將全部 {preview_close} 口出場"
+        msg = (
+            f"🔼 <b>[SMC 加倉通知 - 2★訊號覆蓋1★持倉]</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"<b>觸發時間</b>：{dt_str}\n"
+            f"<b>訊號類型</b>：{signal_tg_name}\n"
+            f"<b>加碼部位</b>：+{add_lots} 口（{old_lots} → {new_lots} 口）\n"
+            f"<b>更新 SL</b>：<code>{sl_int}</code>｜<b>更新 TP1</b>：<code>{tp_int}</code>\n"
+            f"<b>停利規劃</b>：{remain_note}"
+        )
+        send_telegram_notification(msg, chat_id=TELEGRAM_SIGNAL_CHAT_ID)
+
+        if self.api is not None and self.contract is not None:
+            try:
+                act = sj.constant.Action.Buy if direction == "LONG" else sj.constant.Action.Sell
+                order = self.api.Order(
+                    action=act,
+                    price=e_int,
+                    quantity=add_lots,
+                    order_type=sj.constant.OrderType.ROD,
+                    price_type=sj.constant.StockPriceType.LMT,
+                    market_type=sj.constant.MarketType.Future
+                )
+                trade = self.api.place_order(self.contract, order)
+                logger.signal(f"✅ [Shioaji 加碼下單成功] 交易單號: {trade.order.id}")
+            except Exception as e:
+                logger.error(f"❌ [Shioaji 加碼下單失敗]: {str(e)}")
+
+    def _reverse_position(self, new_direction: str, signal_tg_name: str, entry_price: float,
+                           sl_price: float, tp1_price: float, dt_str: str, current_price: float):
+        """2★ 訊號反方向覆蓋 1★ 持倉：先以目前市價強制平倉舊部位，再反向開 1 口新倉。"""
+        pos = self.active_position
+        # 若已過 TP1（stage 2），實際剩餘口數是 remaining_lots；否則是完整 lots
+        lots = pos.get('remaining_lots', pos.get('lots', 2)) if pos.get('stage') == 2 else pos.get('lots', 2)
+
+        # 以目前市價強制平倉（不論目前在 stage 1 或 stage 2），公式與 _check_position_settlement 一致
+        net_pts, net_pnl = self._calc_pnl(pos['entry_price'], current_price, pos['direction'], lots)
+        tot_pnl = pos.get('pnl_stage1', 0.0) + net_pnl  # 若先前已在 TP1 落袋一筆，一併加總
+
+        close_dir_label = "多單 (LONG)" if pos['direction'] == 'LONG' else "空單 (SHORT)"
+        msg = (
+            f"🔄 <b>[SMC 模擬單平倉戰報 - 2★訊號反向覆蓋1★持倉]</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"<b>原交易方向</b>：{close_dir_label}（{lots} 口）\n"
+            f"<b>平倉時間</b>：{dt_str}\n"
+            f"<b>平倉原因</b>：🔄 偵測到反方向 2★ 訊號（{signal_tg_name}），強制平倉反手\n\n"
+            f"<b>進場價格</b>：<code>{int(round(pos['entry_price']))}</code>\n"
+            f"<b>平倉價格</b>：<code>{int(round(current_price))}</code>\n"
+            f"<b>本次盈虧</b>：<code>{net_pnl:+,.0f} NTD</code>\n\n"
+            f"🏆 <b>該單累積總損益</b>：<code>{tot_pnl:+,.0f} NTD</code>"
+        )
+        logger.signal(f"🔄 2★訊號反向覆蓋 1★ 持倉，強制平倉並反手：{tot_pnl:+,.0f} NTD")
+        send_telegram_notification(msg, chat_id=TELEGRAM_SETTLEMENT_CHAT_ID)
+
+        self.active_position = None
+
+        # 平倉後立刻反向開 1 口新倉（非標準 2 口 / 2 階段停利模型）
+        self._place_simulated_2stage_order(new_direction, entry_price, sl_price, tp1_price, signal_level=2, lots=1)
+
+    def _place_simulated_2stage_order(self, direction: str, entry_price: float, sl_price: float,
+                                       tp1_price: float, signal_level: int = 1, lots: int = 2):
+        """透過 Shioaji 模擬環境自動送出限價進場與二階段分批停利委託
+
+        Args:
+            signal_level: 開倉訊號的星級（1=Sweep, 2=MSS, 3=CISD），記錄在持倉上供後續覆蓋規則判斷。
+            lots: 下單口數，預設 2 口（標準 2 階段停利模型）；反向覆蓋開倉時為 1 口。
+        """
         e_int = int(round(entry_price))
         sl_int = int(round(sl_price))
         tp_int = int(round(tp1_price))
         
-        logger.info(f"🤖 [Shioaji 模擬下單觸發] 自動發起 2 口小台 {direction} 委託 | 限價: {e_int}, SL: {sl_int}, TP1: {tp_int}")
+        logger.info(f"🤖 [Shioaji 模擬下單觸發] 自動發起 {lots} 口小台 {direction} 委託 | 限價: {e_int}, SL: {sl_int}, TP1: {tp_int}")
         
         # 設定即時持倉追蹤 (二階段停利)
         self.active_position = {
@@ -439,16 +646,24 @@ class LiveMonitor:
             'entry_price': entry_price,
             'sl': sl_price,
             'tp1': tp1_price,
-            'stage': 1
+            'stage': 1,
+            'signal_level': signal_level,
+            'lots': lots
         }
         
-        if hasattr(self, 'api') and self.api is not None and hasattr(self, 'contract') and self.contract is None:
+        # [FIX] 原判斷式為 `hasattr(self, 'api') and ... and self.contract is None`：
+        # self.api / self.contract 從未在別處被賦值，hasattr 永遠是 False，
+        # 且就算賦值了，`self.contract is None` 這個條件邏輯也是反的
+        # （應該是「有合約才下單」而不是「沒合約才下單」）。
+        # 這裡改為 self.api / self.contract 已在 _run_shioaji() 中綁定，
+        # 且合約存在時才真正送出委託。
+        if self.api is not None and self.contract is not None:
             try:
                 act = sj.constant.Action.Buy if direction == "LONG" else sj.constant.Action.Sell
                 order = self.api.Order(
                     action=act,
                     price=e_int,
-                    quantity=2,  # 自動下單 2 口小台以利二階段分批停利
+                    quantity=lots,  # 依 signal_level/覆蓋規則決定口數（標準開倉 2 口，反向覆蓋開倉 1 口）
                     order_type=sj.constant.OrderType.ROD,
                     price_type=sj.constant.StockPriceType.LMT,
                     market_type=sj.constant.MarketType.Future
@@ -458,8 +673,25 @@ class LiveMonitor:
             except Exception as e:
                 logger.error(f"❌ [Shioaji 模擬帳戶下單失敗]: {str(e)}")
 
+    def _calc_pnl(self, entry_price: float, exit_price: float, direction: str, lots: int) -> "tuple[float, float]":
+        """依離場價格與口數，計算扣除滑價與手續費後的淨點數與淨損益(NTD)。
+
+        [FIX] 舊版公式（`net_pts*50 - 100`）完全沒有依口數縮放，就算文字寫「2 口」，
+        算出來的錢其實只等於 1 口的損益。這裡統一改用小台每口 50 NTD 點值，
+        並依 config.py 的 SLIPPAGE_POINTS / COMMISSION_FEE（單邊）換算成來回成本，
+        正確依 `lots` 縮放。
+        """
+        dir_mult = 1 if direction == 'LONG' else -1
+        net_pts = (exit_price - entry_price) * dir_mult - ROUNDTRIP_SLIPPAGE_PTS
+        net_pnl = net_pts * MINI_POINT_VALUE * lots - ROUNDTRIP_COMMISSION_PER_LOT * lots
+        return net_pts, net_pnl
+
     def _check_position_settlement(self, last_bar: Dict[str, Any]):
-        """即時檢查持倉是否到達 TP1 (3.0x RR)、保本點 SL、或反轉訊號，並自動發送 Telegram 戰報至平倉頻道 (-1004387856503)"""
+        """即時檢查持倉是否到達 TP1 (3.0x RR)、保本點 SL、或反轉訊號，並自動發送 Telegram 戰報至平倉頻道 (-1004387856503)
+
+        分批停利規則（TP1 到價時）：鎖利優先 —— 平掉 ceil(總口數/2) 口，剩餘口數繼續保本續抱。
+        例：2 口 → 平 1 口留 1 口；3 口（2★加碼後）→ 平 2 口留 1 口；1 口（反向覆蓋開倉）→ 全部平掉、無 stage 2。
+        """
         pos = self.active_position
         if pos is None:
             return
@@ -470,15 +702,14 @@ class LiveMonitor:
         dt_str = last_bar['ts'].strftime('%Y-%m-%d %H:%M:%S')
         
         dir_label = "多單 (LONG)" if pos['direction'] == 'LONG' else "空單 (SHORT)"
-        dir_mult = 1 if pos['direction'] == 'LONG' else -1
+        total_lots = pos.get('lots', 2)
         
-        # Stage 1: 尚未到達 TP1 (持有 100% 部位, 2口)
+        # Stage 1: 尚未到達 TP1 (持有 100% 部位)
         if pos['stage'] == 1:
             is_sl_hit = (low <= pos['sl']) if pos['direction'] == 'LONG' else (high >= pos['sl'])
             if is_sl_hit:
                 sl_p = pos['sl']
-                net_pts = (sl_p - pos['entry_price']) * dir_mult - 2.0
-                net_pnl = (net_pts * 50.0) - 100.0
+                net_pts, net_pnl = self._calc_pnl(pos['entry_price'], sl_p, pos['direction'], total_lots)
                 
                 msg = (
                     f"🛑 <b>[SMC 模擬單平倉戰報 - 停損出場]</b>\n"
@@ -489,7 +720,7 @@ class LiveMonitor:
                     f"<b>平倉原因</b>：🛑 觸及 SL 停損價\n\n"
                     f"<b>進場價格</b>：<code>{int(round(pos['entry_price']))}</code>\n"
                     f"<b>平倉價格</b>：<code>{int(round(sl_p))}</code>\n"
-                    f"<b>平倉部位</b>：2 口\n"
+                    f"<b>平倉部位</b>：{total_lots} 口\n"
                     f"<b>本次盈虧</b>：<code>{net_pnl:+,.0f} NTD</code> ({net_pts:+.1f} 點)"
                 )
                 logger.signal(f"模擬單觸及 SL 停損，發送平倉戰報至 ID {TELEGRAM_SETTLEMENT_CHAT_ID}: {net_pnl:+,.0f} NTD")
@@ -500,12 +731,33 @@ class LiveMonitor:
             is_tp1_hit = (high >= pos['tp1']) if pos['direction'] == 'LONG' else (low <= pos['tp1'])
             if is_tp1_hit:
                 tp1_p = pos['tp1']
-                net_pts = (tp1_p - pos['entry_price']) * dir_mult - 2.0
-                net_pnl_50 = ((net_pts * 50.0) - 100.0) * 0.5
+                close_lots = math.ceil(total_lots / 2)   # 鎖利優先：平掉「一半以上」
+                remain_lots = total_lots - close_lots
+                net_pts, net_pnl_partial = self._calc_pnl(pos['entry_price'], tp1_p, pos['direction'], close_lots)
+                
+                if remain_lots <= 0:
+                    # 只有 1 口（例如反向覆蓋開倉），平掉即代表全部出場，不進入 stage 2
+                    msg = (
+                        f"🎯 <b>[SMC 模擬單平倉戰報 - TP1 全部出場]</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"<b>交易標的</b>：台指期近月 (TXFR1)\n"
+                        f"<b>交易方向</b>：{dir_label}\n"
+                        f"<b>平倉時間</b>：{dt_str}\n"
+                        f"<b>平倉原因</b>：🎯 到達 TP1 第一目標 (3.0x RR)，僅 {total_lots} 口，全部出場\n\n"
+                        f"<b>進場價格</b>：<code>{int(round(pos['entry_price']))}</code>\n"
+                        f"<b>平倉價格</b>：<code>{int(round(tp1_p))}</code>\n"
+                        f"<b>平倉部位</b>：{close_lots} 口 (全部)\n\n"
+                        f"🏆 <b>該單累積總損益</b>：<code>{net_pnl_partial:+,.0f} NTD</code> (本單圓滿結束！)"
+                    )
+                    logger.signal(f"模擬單觸及 TP1 全部出場（僅{total_lots}口），發送戰報至 ID {TELEGRAM_SETTLEMENT_CHAT_ID}: {net_pnl_partial:+,.0f} NTD")
+                    send_telegram_notification(msg, chat_id=TELEGRAM_SETTLEMENT_CHAT_ID)
+                    self.active_position = None
+                    return
                 
                 pos['stage'] = 2
                 pos['sl'] = pos['entry_price']  # 移動保本
-                pos['pnl_stage1'] = net_pnl_50
+                pos['pnl_stage1'] = net_pnl_partial
+                pos['remaining_lots'] = remain_lots
                 
                 msg = (
                     f"🎉 <b>[SMC 模擬單平倉戰報 - 部分停利]</b>\n"
@@ -516,15 +768,15 @@ class LiveMonitor:
                     f"<b>平倉原因</b>：🎯 到達 TP1 第一目標 (3.0x RR)！\n\n"
                     f"<b>進場價格</b>：<code>{int(round(pos['entry_price']))}</code>\n"
                     f"<b>平倉價格</b>：<code>{int(round(tp1_p))}</code>\n"
-                    f"<b>平倉部位</b>：1 口 (50% 部位落袋為安)\n"
-                    f"<b>本次盈虧</b>：<code>{net_pnl_50:+,.0f} NTD</code>\n\n"
-                    f"🛡️ <b>風控狀態</b>：剩餘 1 口部位停損價已自動拉回保本價 (<code>{int(round(pos['entry_price']))}</code>)！"
+                    f"<b>平倉部位</b>：{close_lots} 口 (共 {total_lots} 口落袋為安)\n"
+                    f"<b>本次盈虧</b>：<code>{net_pnl_partial:+,.0f} NTD</code>\n\n"
+                    f"🛡️ <b>風控狀態</b>：剩餘 {remain_lots} 口部位停損價已自動拉回保本價 (<code>{int(round(pos['entry_price']))}</code>)！"
                 )
-                logger.signal(f"模擬單觸及 TP1 平倉 50%，發送部分停利戰報至 ID {TELEGRAM_SETTLEMENT_CHAT_ID}: {net_pnl_50:+,.0f} NTD")
+                logger.signal(f"模擬單觸及 TP1 平倉 {close_lots}/{total_lots} 口，發送部分停利戰報至 ID {TELEGRAM_SETTLEMENT_CHAT_ID}: {net_pnl_partial:+,.0f} NTD")
                 send_telegram_notification(msg, chat_id=TELEGRAM_SETTLEMENT_CHAT_ID)
                 return
 
-        # Stage 2: 已平倉 50% 且保本 (持有剩餘 50% 部位, 1口)
+        # Stage 2: 已於 TP1 平掉一部分且保本 (持有 pos['remaining_lots'] 口)
         elif pos['stage'] == 2:
             closed = False
             exit_p = 0.0
@@ -542,9 +794,9 @@ class LiveMonitor:
                     exit_p, reason, closed = price, "🚨 檢測到反向多頭 SMC 訊號", True
                     
             if closed:
-                net_pts = (exit_p - pos['entry_price']) * dir_mult - 2.0
-                net_pnl_50 = ((net_pts * 50.0) - 100.0) * 0.5
-                tot_pnl = pos.get('pnl_stage1', 0.0) + net_pnl_50
+                remain_lots = pos.get('remaining_lots', total_lots - math.ceil(total_lots / 2))
+                net_pts, net_pnl_remain = self._calc_pnl(pos['entry_price'], exit_p, pos['direction'], remain_lots)
+                tot_pnl = pos.get('pnl_stage1', 0.0) + net_pnl_remain
                 
                 msg = (
                     f"🎯 <b>[SMC 模擬單平倉戰報 - 最終結算]</b>\n"
@@ -555,8 +807,8 @@ class LiveMonitor:
                     f"<b>平倉原因</b>：{reason}\n\n"
                     f"<b>進場價格</b>：<code>{int(round(pos['entry_price']))}</code>\n"
                     f"<b>平倉價格</b>：<code>{int(round(exit_p))}</code>\n"
-                    f"<b>平倉部位</b>：1 口 (剩餘 50% 部位)\n"
-                    f"<b>後半段損益</b>：<code>{net_pnl_50:+,.0f} NTD</code>\n\n"
+                    f"<b>平倉部位</b>：{remain_lots} 口 (剩餘部位)\n"
+                    f"<b>後半段損益</b>：<code>{net_pnl_remain:+,.0f} NTD</code>\n\n"
                     f"🏆 <b>該單累積總損益</b>：<code>{tot_pnl:+,.0f} NTD</code> (本單圓滿結束！)"
                 )
                 logger.signal(f"模擬單最終平倉，發送最終結算戰報至 ID {TELEGRAM_SETTLEMENT_CHAT_ID}: {tot_pnl:+,.0f} NTD")
