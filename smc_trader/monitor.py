@@ -243,7 +243,13 @@ class LiveMonitor:
     def _on_order_callback(self, stat: sj.OrderState, msg: dict):
         """處理 Shioaji 委託與成交回報"""
         try:
-            if stat == sj.OrderState.TDeal:
+            # [FIX] 原本寫的是 `sj.OrderState.TDeal`，但 Shioaji SDK 的 OrderState
+            # 只有 StockOrder / StockDeal / FuturesOrder / FuturesDeal 四種成員，
+            # 根本沒有 TDeal，一執行就丟 AttributeError（被下面的 except 悄悄吃掉，
+            # 只留一行 error log）。期貨成交要用 FuturesDeal，這正是
+            # 「平倉戰報那個 Telegram 群組完全沒訊息」的 root cause：
+            # 每一筆真實成交回報都在這裡失敗，_process_settlement_deal 從未被呼叫過。
+            if stat == sj.OrderState.FuturesDeal:
                 action = msg.get('action')
                 price = msg.get('price')
                 qty = msg.get('quantity')
@@ -736,7 +742,7 @@ class LiveMonitor:
                 'quantity': add_lots
             }
             logger.info(f"🔧 [模擬模式] 自動觸發加碼成交回報...")
-            self._on_order_callback(sj.OrderState.TDeal if hasattr(sj, 'OrderState') else 10, msg)
+            self._on_order_callback(sj.OrderState.FuturesDeal if hasattr(sj, 'OrderState') else 10, msg)
 
     def _reverse_position(self, new_direction: str, signal_tg_name: str, entry_price: float,
                            sl_price: float, tp1_price: float, dt_str: str, current_price: float):
@@ -816,7 +822,7 @@ class LiveMonitor:
                 'quantity': lots
             }
             logger.info(f"🔧 [模擬模式] 自動觸發進場成交回報...")
-            self._on_order_callback(sj.OrderState.TDeal if hasattr(sj, 'OrderState') else 10, msg)
+            self._on_order_callback(sj.OrderState.FuturesDeal if hasattr(sj, 'OrderState') else 10, msg)
 
     def _calc_pnl(self, entry_price: float, exit_price: float, direction: str, lots: int) -> "tuple[float, float]":
         """依離場價格與口數，計算扣除滑價與手續費後的淨點數與淨損益(NTD)。
@@ -874,7 +880,7 @@ class LiveMonitor:
                 'quantity': lots
             }
             logger.info(f"🔧 [模擬模式] 自動觸發平倉成交回報...")
-            self._on_order_callback(sj.OrderState.TDeal if hasattr(sj, 'OrderState') else 10, msg)
+            self._on_order_callback(sj.OrderState.FuturesDeal if hasattr(sj, 'OrderState') else 10, msg)
 
     def _check_position_settlement(self, last_bar: Dict[str, Any]):
         """即時檢查持倉是否到達 TP1 (3.0x RR)、保本點 SL、或反轉訊號，並自動送出平倉委託"""
