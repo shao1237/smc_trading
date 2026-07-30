@@ -204,8 +204,17 @@ class SMCDetector:
         df_1m['trend_5m'] = df_1m['trend_5m'].fillna('NONE')
         df_1m = df_1m.drop(columns=['close_1m_ts'])
 
-        # 3. 計算 Volume MA 用於檢測爆量
-        df_1m['vol_ma'] = df_1m['volume'].rolling(window=self.volume_ma_period).mean()
+        # 標記日盤與夜盤，隔離跨盤期間的計算
+        import datetime as dt_mod
+        df_1m['session_type'] = np.where(
+            (df_1m['ts'].dt.time >= dt_mod.time(8, 45)) & (df_1m['ts'].dt.time <= dt_mod.time(13, 45)), 
+            'Day', 'Night'
+        )
+
+        # 3. 計算 Volume MA 用於檢測爆量 (隔離日夜盤計算，避免夜盤開盤誤判)
+        df_1m['vol_ma'] = df_1m.groupby('session_type')['volume'].transform(
+            lambda x: x.rolling(window=self.volume_ma_period, min_periods=1).mean()
+        )
         df_1m['is_vol_spike'] = df_1m['volume'] >= (df_1m['vol_ma'] * self.volume_mult)
 
         # 3.5 計算 ATR 與波動濾網標記
@@ -213,10 +222,15 @@ class SMCDetector:
         tr1 = df_1m['high'] - df_1m['low']
         tr2 = (df_1m['high'] - prev_close).abs()
         tr3 = (df_1m['low'] - prev_close).abs()
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        df_1m['tr'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
         
-        df_1m['atr'] = tr.rolling(window=self.atr_period).mean()
-        df_1m['atr_ma'] = df_1m['atr'].rolling(window=self.atr_ma_period).mean()
+        # 隔離日夜盤的 ATR 均線計算，避免早盤高波動影響夜盤初期的波動率判定
+        df_1m['atr'] = df_1m.groupby('session_type')['tr'].transform(
+            lambda x: x.rolling(window=self.atr_period, min_periods=1).mean()
+        )
+        df_1m['atr_ma'] = df_1m.groupby('session_type')['atr'].transform(
+            lambda x: x.rolling(window=self.atr_ma_period, min_periods=1).mean()
+        )
         
         df_1m['is_volatile'] = True
         df_1m.loc[df_1m['atr'].notna() & df_1m['atr_ma'].notna(), 'is_volatile'] = \
