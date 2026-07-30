@@ -295,14 +295,15 @@ class LiveMonitor:
         net_pts, net_pnl = self._calc_pnl(entry_p, exit_price, pos['direction'], req_lots)
         
         # 取得實時餘額
-        balance_str = "無法取得 (模擬帳戶無期貨權限)"
+        balance_str = "無法取得"
         if self.api is not None:
             try:
-                if self.api.futopt_accounts:
-                    margin = self.api.margin(self.api.futopt_accounts[0])
+                fa = self.api.futopt_account
+                if fa is not None:
+                    margin = self.api.margin()
                     balance_str = f"{margin.equity:+,.0f} NTD"
             except Exception as e:
-                pass
+                logger.warning(f"取得餘額失敗: {e}")
                 
         # 根據階段發送對應戰報
         if stage_type == 'SL':
@@ -630,24 +631,26 @@ class LiveMonitor:
         tp_int = int(round(tp1_price))
         dir_label = "多單市價買" if direction == "LONG" else "空單市價賣"
 
+        # 1. 無論如何，所有觸發的訊號都要純粹地推播到「訊號來源地」(SIGNAL_CHAT_ID)
+        pure_signal_text = (
+            f"觸發時間：{dt_str}\n"
+            f"最新價格：{p_int}\n"
+            f"大結構趨勢 (5M)：{trend_5m}\n"
+            f"🚨 訊號類型：{signal_tg_name}\n"
+            f"💡 {dir_label}：{e_int} | SL：{sl_int}  | TP：{tp_int}"
+        )
+        send_telegram_notification(pure_signal_text, chat_id=TELEGRAM_SIGNAL_CHAT_ID)
+
         if pos is None:
             # 保護機制：若現價距離掛單價太遠（例如跳空造成），為避免 Shioaji 模擬交易所 bug（會直接以市價異常成交），略過下單
             # 此為舊版限價進場的保護，既然改為市價進場，此保護機制可暫時保留以防極端跳空，但可放寬
             if abs(price - entry_price) > 300:
                 skip_msg = f"⏸️ [極端跳空過濾] 現價 {p_int} 距離理論邊界過遠（>300點），略過本次下單。"
                 logger.info(skip_msg)
-                send_telegram_notification(skip_msg, chat_id=TELEGRAM_SIGNAL_CHAT_ID)
+                send_telegram_notification(skip_msg, chat_id=TELEGRAM_SETTLEMENT_CHAT_ID)
                 return
                 
-            # 目前無持倉，正常開新倉
-            tg_text = (
-                f"觸發時間：{dt_str}\n"
-                f"最新價格：{p_int}\n"
-                f"大結構趨勢 (5M)：{trend_5m}\n"
-                f"🚨 訊號類型：{signal_tg_name}\n"
-                f"💡 {dir_label}：{e_int} | SL：{sl_int}  | TP：{tp_int}"
-            )
-            send_telegram_notification(tg_text, chat_id=TELEGRAM_SIGNAL_CHAT_ID)
+            # 目前無持倉，正常開新倉 (已在上面發送純訊號，此處直接下單)
             self._place_simulated_2stage_order(direction, entry_price, sl_price, tp1_price, signal_level=signal_level, lots=2)
             return
 
