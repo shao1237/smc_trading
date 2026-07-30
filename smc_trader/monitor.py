@@ -273,7 +273,6 @@ class LiveMonitor:
                     tp_int = int(round(pos.get('tp1', 0)))
                     lots = pos.get('lots', 2)
                     
-                    from smc_trader.telegram_bot import send_telegram_notification, TELEGRAM_SETTLEMENT_CHAT_ID
                     open_msg = (
                         f"🆕 <b>[SMC 真實開倉戰報]</b>\n"
                         f"━━━━━━━━━━━━━━━━━━\n"
