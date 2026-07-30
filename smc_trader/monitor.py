@@ -430,6 +430,12 @@ class LiveMonitor:
         # 供主迴圈健康檢查使用：只要有進到這裡就代表確實收到報價
         self.last_tick_time = datetime.datetime.now()
 
+        # 過濾非交易時段的盤後試撮報價 (13:45 ~ 14:59:59 與 05:00 ~ 08:44:59)
+        t = dt.time()
+        if (datetime.time(13, 45) <= t < datetime.time(15, 0)) or (datetime.time(5, 0) <= t < datetime.time(8, 45)):
+            # 盤後試撮期間不處理任何 tick，避免錯誤觸發訊號或平倉
+            return
+
         # [FIX] 防止斷線重連或延遲補送時，收到「時間戳早於目前這根K棒起始時間」的
         # 亂序 tick。若不擋掉，append 進 history_1m 後 ts 不再單調遞增，
         # 之後 _analyze_and_print_state() 裡的 df_1m.resample(on='ts') 會直接
@@ -953,15 +959,17 @@ class LiveMonitor:
             closed = False
             reason = ""
             
+            is_volatile = last_bar.get('is_volatile', True)
+            
             if pos['direction'] == 'LONG':
                 if low <= pos['sl']:
                     reason, closed = "🛑 觸及進場保本價", True
-                elif last_bar['mss_bearish'] or last_bar['sweep_high']:
+                elif (last_bar['mss_bearish'] or last_bar['sweep_high']) and is_volatile:
                     reason, closed = "🚨 檢測到反向空頭 SMC 訊號", True
             else: # SHORT
                 if high >= pos['sl']:
                     reason, closed = "🛑 觸及進場保本價", True
-                elif last_bar['mss_bullish'] or last_bar['sweep_low']:
+                elif (last_bar['mss_bullish'] or last_bar['sweep_low']) and is_volatile:
                     reason, closed = "🚨 檢測到反向多頭 SMC 訊號", True
                     
             if closed:
