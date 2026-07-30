@@ -571,10 +571,8 @@ class LiveMonitor:
             if is_volatile:
                 if is_bullish_signal:
                     ob_low = last_bar['bullish_ob_low']
-                    ob_high = last_bar['bullish_ob_high']
-                    fvg_high = last_bar['bullish_fvg_high']
                     
-                    entry_price = ob_high if not np.isnan(ob_high) else fvg_high
+                    entry_price = price  # Combo #11: OB未失效即刻市價敲進
                     sl_price = ob_low if not np.isnan(ob_low) else (last_bar['confirmed_sl_1m'] if not np.isnan(last_bar['confirmed_sl_1m']) else last_bar['low'] - 15.0)
                     
                     if not np.isnan(entry_price) and not np.isnan(sl_price) and price > sl_price:
@@ -593,11 +591,9 @@ class LiveMonitor:
                         self._handle_signal_action("LONG", signal_level, signal_tg_name, entry_price, sl_price, tp1_price, price, dt_str, trend_5m)
                         
                 elif is_bearish_signal:
-                    ob_low = last_bar['bearish_ob_low']
                     ob_high = last_bar['bearish_ob_high']
-                    fvg_low = last_bar['bearish_fvg_low']
                     
-                    entry_price = ob_low if not np.isnan(ob_low) else fvg_low
+                    entry_price = price  # Combo #11: OB未失效即刻市價敲進
                     sl_price = ob_high if not np.isnan(ob_high) else (last_bar['confirmed_sh_1m'] if not np.isnan(last_bar['confirmed_sh_1m']) else last_bar['high'] + 15.0)
                     
                     if not np.isnan(entry_price) and not np.isnan(sl_price) and price < sl_price:
@@ -632,9 +628,17 @@ class LiveMonitor:
         e_int = int(round(entry_price))
         sl_int = int(round(sl_price))
         tp_int = int(round(tp1_price))
-        dir_label = "多單限價買" if direction == "LONG" else "空單限價賣"
+        dir_label = "多單市價買" if direction == "LONG" else "空單市價賣"
 
         if pos is None:
+            # 保護機制：若現價距離掛單價太遠（例如跳空造成），為避免 Shioaji 模擬交易所 bug（會直接以市價異常成交），略過下單
+            # 此為舊版限價進場的保護，既然改為市價進場，此保護機制可暫時保留以防極端跳空，但可放寬
+            if abs(price - entry_price) > 300:
+                skip_msg = f"⏸️ [極端跳空過濾] 現價 {p_int} 距離理論邊界過遠（>300點），略過本次下單。"
+                logger.info(skip_msg)
+                send_telegram_notification(skip_msg, chat_id=TELEGRAM_SIGNAL_CHAT_ID)
+                return
+                
             # 目前無持倉，正常開新倉
             tg_text = (
                 f"觸發時間：{dt_str}\n"
@@ -713,10 +717,10 @@ class LiveMonitor:
                 act = sj.Action.Buy if direction == "LONG" else sj.Action.Sell
                 order = self.api.Order(
                     action=act,
-                    price=e_int,
+                    price=0,
                     quantity=add_lots,
                     order_type=sj.OrderType.ROD,
-                    price_type=sj.FuturesPriceType.LMT if hasattr(sj, 'FuturesPriceType') else sj.StockPriceType.LMT
+                    price_type=sj.FuturesPriceType.MKT if hasattr(sj, 'FuturesPriceType') else sj.StockPriceType.MKT
                 )
                 trade = self.api.place_order(self.contract, order)
                 
@@ -795,10 +799,10 @@ class LiveMonitor:
                 act = sj.Action.Buy if direction == "LONG" else sj.Action.Sell
                 order = self.api.Order(
                     action=act,
-                    price=e_int,
-                    quantity=lots,  # 依 signal_level/覆蓋規則決定口數（標準開倉 2 口，反向覆蓋開倉 1 口）
-                    order_type=sj.OrderType.ROD,
-                    price_type=sj.FuturesPriceType.LMT if hasattr(sj, 'FuturesPriceType') else sj.StockPriceType.LMT
+                    price=0, # 市價單不指定價格
+                    quantity=lots,  # 依 signal_level/覆蓋規則決定口數
+                    order_type=sj.OrderType.ROD, # 市價單(MKT) 在 Shioaji 也可以搭配 ROD
+                    price_type=sj.FuturesPriceType.MKT if hasattr(sj, 'FuturesPriceType') else sj.StockPriceType.MKT
                 )
                 trade = self.api.place_order(self.contract, order)
                 
