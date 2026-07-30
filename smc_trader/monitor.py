@@ -590,6 +590,8 @@ class LiveMonitor:
                         
                         logger.signal(f"訊號觸發，發送 Telegram 即時監控通知 (ID: {TELEGRAM_SIGNAL_CHAT_ID}): {signal_tg_name}")
                         self._handle_signal_action("LONG", signal_level, signal_tg_name, entry_price, sl_price, tp1_price, price, dt_str, trend_5m)
+                    else:
+                        logger.info(f"       🚫 [訊號過濾] 多頭條件不足: entry_price={entry_price}, sl_price={sl_price}, 現價={price} (現價需大於SL)")
                         
                 elif is_bearish_signal:
                     ob_high = last_bar['bearish_ob_high']
@@ -611,6 +613,8 @@ class LiveMonitor:
                         
                         logger.signal(f"訊號觸發，發送 Telegram 即時監控通知 (ID: {TELEGRAM_SIGNAL_CHAT_ID}): {signal_tg_name}")
                         self._handle_signal_action("SHORT", signal_level, signal_tg_name, entry_price, sl_price, tp1_price, price, dt_str, trend_5m)
+                    else:
+                        logger.info(f"       🚫 [訊號過濾] 空頭條件不足: entry_price={entry_price}, sl_price={sl_price}, 現價={price} (現價需小於SL)")
 
     def _handle_signal_action(self, direction: str, signal_level: int, signal_tg_name: str,
                                entry_price: float, sl_price: float, tp1_price: float,
