@@ -80,6 +80,7 @@ class LiveMonitor:
         self.contract: Optional[Any] = None
 
         # 預先載入一部分歷史數據以讓 Swing Points 能夠在初始時就能被計算
+        self._init_balance_file()
         self._init_history()
 
     def _init_history(self):
@@ -315,16 +316,9 @@ class LiveMonitor:
         
         net_pts, net_pnl = self._calc_pnl(entry_p, exit_price, pos['direction'], req_lots)
         
-        # 取得實時餘額
-        balance_str = "無法取得"
-        if self.api is not None:
-            try:
-                fa = self.api.futopt_account
-                if fa is not None:
-                    margin = self.api.margin()
-                    balance_str = f"{margin.equity:+,.0f} NTD"
-            except Exception as e:
-                logger.warning(f"取得餘額失敗: {e}")
+        # 將本次淨損益累計到本地餘額暫存檔
+        self._update_balance(net_pnl)
+        balance_str = f"{self._get_balance():+,.0f} NTD"
                 
         # 根據階段發送對應戰報
         if stage_type == 'SL':
@@ -876,6 +870,40 @@ class LiveMonitor:
         net_pts = (exit_price - entry_price) * dir_mult - ROUNDTRIP_SLIPPAGE_PTS
         net_pnl = net_pts * MINI_POINT_VALUE * lots - ROUNDTRIP_COMMISSION_PER_LOT * lots
         return net_pts, net_pnl
+
+    # ── 餘額暫存檔管理 ──
+    def _init_balance_file(self):
+        """初始化或載入餘額暫存檔"""
+        import json
+        balance_file = os.path.join(os.path.dirname(__file__), "..", "data", "balance.json")
+        try:
+            os.makedirs(os.path.dirname(balance_file), exist_ok=True)
+            if not os.path.exists(balance_file):
+                with open(balance_file, "w") as f:
+                    json.dump({"equity": 0, "last_update": ""}, f)
+                logger.info("已建立餘額暫存檔，初始值 0")
+        except Exception as e:
+            logger.warning(f"初始化餘額暫存檔失敗: {e}")
+
+    def _get_balance(self) -> float:
+        """讀取暫存餘額"""
+        import json
+        balance_file = os.path.join(os.path.dirname(__file__), "..", "data", "balance.json")
+        try:
+            with open(balance_file, "r") as f:
+                return json.load(f).get("equity", 0)
+        except:
+            return 0
+
+    def _update_balance(self, pnl: float):
+        """將淨損益累加入暫存餘額"""
+        import json
+        balance_file = os.path.join(os.path.dirname(__file__), "..", "data", "balance.json")
+        current = self._get_balance()
+        new_balance = current + pnl
+        with open(balance_file, "w") as f:
+            json.dump({"equity": new_balance, "last_update": datetime.datetime.now().isoformat()}, f)
+        logger.info(f"餘額更新: {current:+,.0f} -> {new_balance:+,.0f} NTD (本次 {pnl:+,.0f})")
 
     def _send_close_order(self, lots: int, stage_type: str, reason: str):
         pos = self.active_position
