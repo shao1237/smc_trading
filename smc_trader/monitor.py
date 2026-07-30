@@ -667,7 +667,7 @@ class LiveMonitor:
             f"🚨 訊號類型：{signal_tg_name}\n"
             f"⏸️ 已持倉不開新倉"
         )
-        send_telegram_notification(skip_text, chat_id=TELEGRAM_SIGNAL_CHAT_ID)
+        send_telegram_notification(skip_text, chat_id=TELEGRAM_SETTLEMENT_CHAT_ID)
 
     def _add_on_position(self, direction: str, signal_tg_name: str, entry_price: float,
                           sl_price: float, tp1_price: float, dt_str: str):
@@ -710,7 +710,7 @@ class LiveMonitor:
             f"<b>更新 SL</b>：<code>{sl_int}</code>｜<b>更新 TP1</b>：<code>{tp_int}</code>\n"
             f"<b>停利規劃</b>：{remain_note}"
         )
-        send_telegram_notification(msg, chat_id=TELEGRAM_SIGNAL_CHAT_ID)
+        send_telegram_notification(msg, chat_id=TELEGRAM_SETTLEMENT_CHAT_ID)
 
         if self.api is not None and self.contract is not None:
             try:
