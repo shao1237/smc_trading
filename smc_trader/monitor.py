@@ -262,6 +262,27 @@ class LiveMonitor:
                 # 若為進場單，記錄真實成交均價（為簡化，直接取第一筆成交價或更新均價）
                 if 'real_entry_price' not in pos:
                     pos['real_entry_price'] = float(price)
+                    
+                    # 發送真實開倉戰報 (因模擬/真實單皆會觸發 callback，此處為真正確立持倉的時機)
+                    direction = pos.get('direction', 'UNKNOWN')
+                    dir_label = "多單市價買" if direction == "LONG" else "空單市價賣"
+                    dt_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    e_int = int(round(float(price)))
+                    sl_int = int(round(pos.get('sl', 0)))
+                    tp_int = int(round(pos.get('tp1', 0)))
+                    lots = pos.get('lots', 2)
+                    
+                    from smc_trader.telegram_bot import send_telegram_notification, TELEGRAM_SETTLEMENT_CHAT_ID
+                    open_msg = (
+                        f"🆕 <b>[SMC 真實開倉戰報]</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"<b>成交時間</b>：{dt_str}\n"
+                        f"<b>交易方向</b>：{direction} ({dir_label})\n"
+                        f"<b>成交價格</b>：<code>{e_int}</code>\n"
+                        f"<b>設定 SL</b>：<code>{sl_int}</code>｜<b>目標 TP1</b>：<code>{tp_int}</code>\n"
+                        f"<b>持倉部位</b>：{lots} 口"
+                    )
+                    send_telegram_notification(open_msg, chat_id=TELEGRAM_SETTLEMENT_CHAT_ID)
                 
                 # 若有正在等待的平倉單
                 if 'pending_close' in pos:
@@ -656,17 +677,7 @@ class LiveMonitor:
                 send_telegram_notification(skip_msg, chat_id=TELEGRAM_SETTLEMENT_CHAT_ID)
                 return
                 
-            # 目前無持倉，正常開新倉 (已在上面發送純訊號，此處發送開倉戰報)
-            open_msg = (
-                f"🆕 <b>[SMC 開新倉通知]</b>\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"<b>觸發時間</b>：{dt_str}\n"
-                f"<b>交易方向</b>：{direction} ({dir_label})\n"
-                f"<b>進場價格</b>：<code>{e_int}</code>\n"
-                f"<b>初始 SL</b>：<code>{sl_int}</code>｜<b>目標 TP1</b>：<code>{tp_int}</code>\n"
-                f"<b>開倉部位</b>：2 口"
-            )
-            send_telegram_notification(open_msg, chat_id=TELEGRAM_SETTLEMENT_CHAT_ID)
+            # 目前無持倉，正常開新倉 (已在上面發送純訊號，真實成交戰報將交由 callback 處理)
             self._place_simulated_2stage_order(direction, entry_price, sl_price, tp1_price, signal_level=signal_level, lots=2)
             return
 
