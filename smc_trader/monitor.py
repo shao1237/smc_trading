@@ -254,6 +254,7 @@ class LiveMonitor:
                 action = msg.get('action')
                 price = msg.get('price')
                 qty = msg.get('quantity')
+                print()  # 換行，避免與即時報價的 \r 衝撞
                 logger.info(f"⚡ [成交回報] Action: {action}, 價格: {price}, 口數: {qty}")
                 
                 pos = self.active_position
