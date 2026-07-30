@@ -650,7 +650,17 @@ class LiveMonitor:
                 send_telegram_notification(skip_msg, chat_id=TELEGRAM_SETTLEMENT_CHAT_ID)
                 return
                 
-            # 目前無持倉，正常開新倉 (已在上面發送純訊號，此處直接下單)
+            # 目前無持倉，正常開新倉 (已在上面發送純訊號，此處發送開倉戰報)
+            open_msg = (
+                f"🆕 <b>[SMC 開新倉通知]</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"<b>觸發時間</b>：{dt_str}\n"
+                f"<b>交易方向</b>：{direction} ({dir_label})\n"
+                f"<b>進場價格</b>：<code>{e_int}</code>\n"
+                f"<b>初始 SL</b>：<code>{sl_int}</code>｜<b>目標 TP1</b>：<code>{tp_int}</code>\n"
+                f"<b>開倉部位</b>：2 口"
+            )
+            send_telegram_notification(open_msg, chat_id=TELEGRAM_SETTLEMENT_CHAT_ID)
             self._place_simulated_2stage_order(direction, entry_price, sl_price, tp1_price, signal_level=signal_level, lots=2)
             return
 
