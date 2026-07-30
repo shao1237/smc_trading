@@ -615,6 +615,8 @@ class LiveMonitor:
                         self._handle_signal_action("SHORT", signal_level, signal_tg_name, entry_price, sl_price, tp1_price, price, dt_str, trend_5m)
                     else:
                         logger.info(f"       🚫 [訊號過濾] 空頭條件不足: entry_price={entry_price}, sl_price={sl_price}, 現價={price} (現價需小於SL)")
+            else:
+                logger.info(f"       🚫 [訊號過濾] 波動率不足 (is_volatile=False)，略過本次訊號")
 
     def _handle_signal_action(self, direction: str, signal_level: int, signal_tg_name: str,
                                entry_price: float, sl_price: float, tp1_price: float,
