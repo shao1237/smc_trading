@@ -322,9 +322,10 @@ class LiveMonitor:
         balance_str = f"{self._get_balance():+,.0f} NTD"
                 
         # 根據階段發送對應戰報
-        if stage_type == 'SL':
+        if stage_type == 'SL' or stage_type == 'SL1':
+            stage_name = "停損出場" if stage_type == 'SL' else "分批停損 (SL1)"
             msg = (
-                f"🛑 <b>[SMC 真實平倉戰報 - 停損出場]</b>\n"
+                f"🛑 <b>[SMC 真實平倉戰報 - {stage_name}]</b>\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
                 f"<b>交易標的</b>：台指期近月 (TXFR1)\n"
                 f"<b>交易方向</b>：{dir_label}\n"
@@ -336,9 +337,14 @@ class LiveMonitor:
                 f"<b>本次盈虧</b>：<code>{net_pnl:+,.0f} NTD</code> ({net_pts:+.1f} 點)\n\n"
                 f"💰 <b>帳戶實時餘額</b>：<code>{balance_str}</code>"
             )
-            logger.signal(f"平倉戰報 (停損): {net_pnl:+,.0f} NTD")
+            logger.signal(f"平倉戰報 ({stage_name}): {net_pnl:+,.0f} NTD")
             send_telegram_notification(msg, chat_id=TELEGRAM_SETTLEMENT_CHAT_ID)
-            self.active_position = None
+            
+            if stage_type == 'SL1':
+                pos['pnl_stage1'] = pos.get('pnl_stage1', 0.0) + net_pnl
+                pos['remaining_lots'] = pos.get('lots', 2) - req_lots
+            else:
+                self.active_position = None
             
         elif stage_type == 'TP1':
             pos['stage'] = 2
@@ -593,56 +599,78 @@ class LiveMonitor:
 
             if is_volatile:
                 if is_bullish_signal:
-                    ob_low = last_bar['bullish_ob_low']
-                    
                     entry_price = price  # Combo #11: OB未失效即刻市價敲進
-                    sl_price = ob_low if not np.isnan(ob_low) else (last_bar['confirmed_sl_1m'] if not np.isnan(last_bar['confirmed_sl_1m']) else last_bar['low'] - 15.0)
+                    ob_low = last_bar['bullish_ob_low']
+                    conf_sl = last_bar['confirmed_sl_1m']
+                    sl1_price, sl2_price = np.nan, np.nan
                     
-                    if not np.isnan(entry_price) and not np.isnan(sl_price) and price > sl_price:
-                        sl_points = entry_price - sl_price
+                    if not np.isnan(ob_low):
+                        sl1_price = ob_low
+                        if not np.isnan(conf_sl) and conf_sl < ob_low:
+                            sl2_price = conf_sl
+                    elif not np.isnan(conf_sl):
+                        sl1_price = conf_sl
+                    else:
+                        sl1_price = last_bar['low'] - 15.0
+                    
+                    if not np.isnan(entry_price) and not np.isnan(sl1_price) and price > sl1_price:
+                        sl_points = entry_price - sl1_price
                         if sl_points <= 5.0:
-                            sl_price = entry_price - 20.0
+                            sl1_price = entry_price - 20.0
                             sl_points = 20.0
-                        elif sl_points > MAX_SL_POINTS:
-                            sl_price = entry_price - MAX_SL_POINTS
+                            
+                        if sl_points > MAX_SL_POINTS:
+                            sl1_price = entry_price - MAX_SL_POINTS
                             sl_points = MAX_SL_POINTS
+                            sl2_price = np.nan # 放棄 SL2，因為 SL1 已經觸及最大停損極限
                         
-                        # TP1 @ 3.0x RR 二階段分批停利第一目標 (經大數據回測驗證最優)
+                        # TP1 @ 3.0x RR (基於 SL1 距離計算)
                         tp1_price = entry_price + sl_points * 3.0
                         
                         logger.signal(f"訊號觸發，發送 Telegram 即時監控通知 (ID: {TELEGRAM_SIGNAL_CHAT_ID}): {signal_tg_name}")
-                        self._handle_signal_action("LONG", signal_level, signal_tg_name, entry_price, sl_price, tp1_price, price, dt_str, trend_5m)
+                        self._handle_signal_action("LONG", signal_level, signal_tg_name, entry_price, sl1_price, tp1_price, price, dt_str, trend_5m, sl2_price)
                     else:
-                        logger.info(f"       🚫 [訊號過濾] 多頭條件不足: entry_price={entry_price}, sl_price={sl_price}, 現價={price} (現價需大於SL)")
+                        logger.info(f"       🚫 [訊號過濾] 多頭條件不足: entry_price={entry_price}, sl1_price={sl1_price}, 現價={price} (現價需大於SL)")
                         
                 elif is_bearish_signal:
-                    ob_high = last_bar['bearish_ob_high']
-                    
                     entry_price = price  # Combo #11: OB未失效即刻市價敲進
-                    sl_price = ob_high if not np.isnan(ob_high) else (last_bar['confirmed_sh_1m'] if not np.isnan(last_bar['confirmed_sh_1m']) else last_bar['high'] + 15.0)
+                    ob_high = last_bar['bearish_ob_high']
+                    conf_sh = last_bar['confirmed_sh_1m']
+                    sl1_price, sl2_price = np.nan, np.nan
                     
-                    if not np.isnan(entry_price) and not np.isnan(sl_price) and price < sl_price:
-                        sl_points = sl_price - entry_price
+                    if not np.isnan(ob_high):
+                        sl1_price = ob_high
+                        if not np.isnan(conf_sh) and conf_sh > ob_high:
+                            sl2_price = conf_sh
+                    elif not np.isnan(conf_sh):
+                        sl1_price = conf_sh
+                    else:
+                        sl1_price = last_bar['high'] + 15.0
+                    
+                    if not np.isnan(entry_price) and not np.isnan(sl1_price) and price < sl1_price:
+                        sl_points = sl1_price - entry_price
                         if sl_points <= 5.0:
-                            sl_price = entry_price + 20.0
+                            sl1_price = entry_price + 20.0
                             sl_points = 20.0
-                        elif sl_points > MAX_SL_POINTS:
-                            sl_price = entry_price + MAX_SL_POINTS
+                            
+                        if sl_points > MAX_SL_POINTS:
+                            sl1_price = entry_price + MAX_SL_POINTS
                             sl_points = MAX_SL_POINTS
+                            sl2_price = np.nan # 放棄 SL2，因為 SL1 已經觸及最大停損極限
                         
-                        # TP1 @ 3.0x RR 二階段分批停利第一目標 (經大數據回測驗證最優)
+                        # TP1 @ 3.0x RR 
                         tp1_price = entry_price - sl_points * 3.0
                         
                         logger.signal(f"訊號觸發，發送 Telegram 即時監控通知 (ID: {TELEGRAM_SIGNAL_CHAT_ID}): {signal_tg_name}")
-                        self._handle_signal_action("SHORT", signal_level, signal_tg_name, entry_price, sl_price, tp1_price, price, dt_str, trend_5m)
+                        self._handle_signal_action("SHORT", signal_level, signal_tg_name, entry_price, sl1_price, tp1_price, price, dt_str, trend_5m, sl2_price)
                     else:
-                        logger.info(f"       🚫 [訊號過濾] 空頭條件不足: entry_price={entry_price}, sl_price={sl_price}, 現價={price} (現價需小於SL)")
+                        logger.info(f"       🚫 [訊號過濾] 空頭條件不足: entry_price={entry_price}, sl1_price={sl1_price}, 現價={price} (現價需小於SL)")
             else:
                 logger.info(f"       🚫 [訊號過濾] 波動率不足 (is_volatile=False)，略過本次訊號")
 
     def _handle_signal_action(self, direction: str, signal_level: int, signal_tg_name: str,
                                entry_price: float, sl_price: float, tp1_price: float,
-                               price: float, dt_str: str, trend_5m: str):
+                               price: float, dt_str: str, trend_5m: str, sl2_price: float = None):
         """
         依「目前持倉狀態」與「新訊號星級」決定動作：
         - 沒有持倉：正常開新倉（2 口 / 2 階段停利，維持原邏輯）
@@ -665,8 +693,11 @@ class LiveMonitor:
             f"最新價格：{p_int}\n"
             f"大結構趨勢 (5M)：{trend_5m}\n"
             f"🚨 訊號類型：{signal_tg_name}\n"
-            f"💡 {dir_label}：{e_int} | SL：{sl_int}  | TP：{tp_int}"
         )
+        if sl2_price is not None and not np.isnan(sl2_price):
+            pure_signal_text += f"💡 {dir_label}：{e_int} | SL1：{sl_int} | SL2：{int(round(sl2_price))} | TP：{tp_int}"
+        else:
+            pure_signal_text += f"💡 {dir_label}：{e_int} | SL：{sl_int}  | TP：{tp_int}"
         send_telegram_notification(pure_signal_text, chat_id=TELEGRAM_SIGNAL_CHAT_ID)
 
         if pos is None:
@@ -679,15 +710,15 @@ class LiveMonitor:
                 return
                 
             # 目前無持倉，正常開新倉 (已在上面發送純訊號，真實成交戰報將交由 callback 處理)
-            self._place_simulated_2stage_order(direction, entry_price, sl_price, tp1_price, signal_level=signal_level, lots=2)
+            self._place_simulated_2stage_order(direction, entry_price, sl_price, tp1_price, signal_level=signal_level, lots=2, sl2_price=sl2_price)
             return
 
         # 已有持倉：唯一允許覆蓋的組合是「目前持倉為 1★ 開倉、且本次新訊號為 2★」
         if pos.get('signal_level') == 1 and signal_level == 2:
             if direction == pos['direction']:
-                self._add_on_position(direction, signal_tg_name, entry_price, sl_price, tp1_price, dt_str)
+                self._add_on_position(direction, signal_tg_name, entry_price, sl_price, tp1_price, dt_str, sl2_price)
             else:
-                self._reverse_position(direction, signal_tg_name, entry_price, sl_price, tp1_price, dt_str, price)
+                self._reverse_position(direction, signal_tg_name, entry_price, sl_price, tp1_price, dt_str, price, sl2_price)
             return
 
         # 其他所有情況：已持倉就不開新倉
@@ -701,7 +732,7 @@ class LiveMonitor:
         send_telegram_notification(skip_text, chat_id=TELEGRAM_SETTLEMENT_CHAT_ID)
 
     def _add_on_position(self, direction: str, signal_tg_name: str, entry_price: float,
-                          sl_price: float, tp1_price: float, dt_str: str):
+                          sl_price: float, tp1_price: float, dt_str: str, sl2_price: float = None):
         """2★ 訊號同方向覆蓋 1★ 持倉：加碼 1 口，套用新訊號的 SL/TP1。"""
         pos = self.active_position
         add_lots = 1
@@ -728,9 +759,15 @@ class LiveMonitor:
 
         pos['lots'] = new_lots
         pos['sl'] = sl_price
+        if sl2_price is not None and not np.isnan(sl2_price):
+            pos['sl2'] = sl2_price
+        else:
+            pos.pop('sl2', None)
+        pos['sl1_hit'] = False
         pos['tp1'] = tp1_price
         pos['signal_level'] = 2  # 持倉升級為 2★
 
+        sl_str = f"SL1: {sl_int} | SL2: {int(round(sl2_price))}" if sl2_price is not None and not np.isnan(sl2_price) else f"SL: {sl_int}"
         remain_note = f"下次 TP1 將平 {preview_close} 口、留 {preview_remain} 口續抱" if preview_remain > 0 else f"下次 TP1 將全部 {preview_close} 口出場"
         msg = (
             f"🔼 <b>[SMC 加倉通知 - 2★訊號覆蓋1★持倉]</b>\n"
@@ -738,7 +775,7 @@ class LiveMonitor:
             f"<b>觸發時間</b>：{dt_str}\n"
             f"<b>訊號類型</b>：{signal_tg_name}\n"
             f"<b>加碼部位</b>：+{add_lots} 口（{old_lots} → {new_lots} 口）\n"
-            f"<b>更新 SL</b>：<code>{sl_int}</code>｜<b>更新 TP1</b>：<code>{tp_int}</code>\n"
+            f"<b>更新 </b>{sl_str}｜<b>更新 TP1</b>：<code>{tp_int}</code>\n"
             f"<b>停利規劃</b>：{remain_note}"
         )
         send_telegram_notification(msg, chat_id=TELEGRAM_SETTLEMENT_CHAT_ID)
@@ -779,8 +816,8 @@ class LiveMonitor:
             logger.info(f"🔧 [模擬模式] 自動觸發加碼成交回報...")
             self._on_order_callback(sj.OrderState.FuturesDeal if hasattr(sj, 'OrderState') else 10, msg)
 
-    def _reverse_position(self, new_direction: str, signal_tg_name: str, entry_price: float,
-                           sl_price: float, tp1_price: float, dt_str: str, current_price: float):
+    def _reverse_position(self, direction: str, signal_tg_name: str, entry_price: float,
+                           sl_price: float, tp1_price: float, dt_str: str, price: float, sl2_price: float = None):
         """2★ 訊號反方向覆蓋 1★ 持倉：先以目前市價強制平倉舊部位，再反向開 1 口新倉。"""
         pos = self.active_position
         lots = pos.get('remaining_lots', pos.get('lots', 2)) if pos.get('stage') == 2 else pos.get('lots', 2)
@@ -790,12 +827,13 @@ class LiveMonitor:
             'direction': new_direction,
             'entry_price': entry_price,
             'sl_price': sl_price,
+            'sl2_price': sl2_price,
             'tp1_price': tp1_price,
         }
         self._send_close_order(lots, 'REVERSE', f"🔄 偵測到反方向 2★ 訊號（{signal_tg_name}），強制平倉反手")
 
     def _place_simulated_2stage_order(self, direction: str, entry_price: float, sl_price: float,
-                                       tp1_price: float, signal_level: int = 1, lots: int = 2):
+                                       tp1_price: float, signal_level: int = 1, lots: int = 2, sl2_price: float = None):
         """透過 Shioaji 模擬環境自動送出限價進場與二階段分批停利委託
 
         Args:
@@ -813,6 +851,8 @@ class LiveMonitor:
             'direction': direction,
             'entry_price': entry_price,
             'sl': sl_price,
+            'sl2': sl2_price,
+            'sl1_hit': False,
             'tp1': tp1_price,
             'stage': 1,
             'signal_level': signal_level,
@@ -937,9 +977,9 @@ class LiveMonitor:
             # 模擬模式 (無真實 API)：直接模擬成交回報
             if pos['direction'] == 'LONG':
                 # 多單平倉 (賣出) 取買價 (此處以當前收盤價模擬)
-                sim_price = pos.get('tp1') if stage_type == 'TP1' else pos.get('sl') if stage_type == 'SL' else pos['entry_price'] # 這裡只是一個大概，實戰會由真實價位取代
+                sim_price = pos.get('tp1') if stage_type == 'TP1' else pos.get('sl') if stage_type in ['SL', 'SL1'] else pos.get('sl2', pos['entry_price']) if 'SL2' in reason else pos['entry_price']
             else:
-                sim_price = pos.get('tp1') if stage_type == 'TP1' else pos.get('sl') if stage_type == 'SL' else pos['entry_price']
+                sim_price = pos.get('tp1') if stage_type == 'TP1' else pos.get('sl') if stage_type in ['SL', 'SL1'] else pos.get('sl2', pos['entry_price']) if 'SL2' in reason else pos['entry_price']
             
             # 使用當前時間模擬成交，或者因為沒有最新 K 線價格，簡單傳入 0 讓 _process_settlement_deal 使用上次理論價格...
             # 其實最好的方法是直接傳遞一個假的 msg 到 _on_order_callback
@@ -969,19 +1009,43 @@ class LiveMonitor:
         
         # Stage 1: 尚未到達 TP1 (持有 100% 部位)
         if pos['stage'] == 1:
-            is_sl_hit = (low <= pos['sl']) if pos['direction'] == 'LONG' else (high >= pos['sl'])
-            if is_sl_hit:
-                self._send_close_order(total_lots, 'SL', "🛑 觸及 SL 停損價")
-                return
-                
+            if not pos.get('sl1_hit', False):
+                is_sl_hit = (low <= pos['sl']) if pos['direction'] == 'LONG' else (high >= pos['sl'])
+                if is_sl_hit:
+                    if pos.get('sl2') and not np.isnan(pos['sl2']):
+                        # 有 SL2，執行分批停損 (SL1)
+                        close_lots = math.ceil(total_lots / 2)
+                        pos['sl1_hit'] = True
+                        self._send_close_order(close_lots, 'SL1', "🛑 觸及 SL1 停損價 (分批停損)")
+                        return
+                    else:
+                        # 沒有 SL2，全數停損
+                        self._send_close_order(total_lots, 'SL', "🛑 觸及 SL 停損價")
+                        return
+            else:
+                # 已經觸發過 SL1，檢查是否觸發 SL2 (最終停損)
+                if pos.get('sl2') and not np.isnan(pos['sl2']):
+                    is_sl2_hit = (low <= pos['sl2']) if pos['direction'] == 'LONG' else (high >= pos['sl2'])
+                    if is_sl2_hit:
+                        remain_lots = pos.get('remaining_lots', total_lots - math.ceil(total_lots / 2))
+                        self._send_close_order(remain_lots, 'FINAL', "🛑 觸及 SL2 停損價 (最終停損)")
+                        return
+
+            # 不論是否觸發過 SL1，只要仍在 stage 1，就可以檢查 TP1
             is_tp1_hit = (high >= pos['tp1']) if pos['direction'] == 'LONG' else (low <= pos['tp1'])
             if is_tp1_hit:
-                close_lots = math.ceil(total_lots / 2)   # 鎖利優先：平掉「一半以上」
-                remain_lots = total_lots - close_lots
-                stage = 'FINAL' if remain_lots <= 0 else 'TP1'
-                reason = f"🎯 到達 TP1 第一目標 (3.0x RR)" + ("，全部出場" if remain_lots <= 0 else "，部分停利")
-                self._send_close_order(close_lots, stage, reason)
-                return
+                # 若已觸發過 SL1，這裡就直接平掉剩餘部位 (以 FINAL 結算)
+                if pos.get('sl1_hit', False):
+                    remain_lots = pos.get('remaining_lots', total_lots - math.ceil(total_lots / 2))
+                    self._send_close_order(remain_lots, 'FINAL', "🎯 觸及 TP1 目標 (剩餘部位全平)")
+                    return
+                else:
+                    close_lots = math.ceil(total_lots / 2)   # 鎖利優先：平掉「一半以上」
+                    remain_lots = total_lots - close_lots
+                    stage = 'FINAL' if remain_lots <= 0 else 'TP1'
+                    reason = f"🎯 到達 TP1 第一目標 (3.0x RR)" + ("，全部出場" if remain_lots <= 0 else "，部分停利")
+                    self._send_close_order(close_lots, stage, reason)
+                    return
 
         # Stage 2: 已於 TP1 平掉一部分且保本 (持有 pos['remaining_lots'] 口)
         elif pos['stage'] == 2:
