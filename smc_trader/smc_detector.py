@@ -359,7 +359,16 @@ class SMCDetector:
                 
                 last_bearish_ob = (ob_low, ob_high)
 
-            # 將最新確定的 OB 記錄到 DataFrame 中，以便回測引擎調用
+            # 5. OB 失效 (Mitigation) 檢查與更新
+            # 如果價格跌破 Bullish OB 的下緣，則該 OB 被「緩解 / 破壞」，宣告失效
+            if last_bullish_ob is not None and lows[i] < last_bullish_ob[0]:
+                last_bullish_ob = None
+                
+            # 如果價格突破 Bearish OB 的上緣，則該 OB 被「緩解 / 破壞」，宣告失效
+            if last_bearish_ob is not None and highs[i] > last_bearish_ob[1]:
+                last_bearish_ob = None
+
+            # 將最新確定且尚未失效的 OB 記錄到 DataFrame 中
             if last_bullish_ob is not None:
                 df_1m.at[i, 'bullish_ob_low'] = last_bullish_ob[0]
                 df_1m.at[i, 'bullish_ob_high'] = last_bullish_ob[1]
