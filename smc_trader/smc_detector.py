@@ -218,7 +218,8 @@ class SMCDetector:
         df_1m['is_vol_spike'] = df_1m['volume'] >= (df_1m['vol_ma'] * self.volume_mult)
 
         # 3.5 計算 ATR 與波動濾網標記
-        prev_close = df_1m['close'].shift(1)
+        # 依 session_type 分組取 shift(1)，避免跨盤跳空缺口污染 TR 計算
+        prev_close = df_1m.groupby('session_type')['close'].shift(1)
         tr1 = df_1m['high'] - df_1m['low']
         tr2 = (df_1m['high'] - prev_close).abs()
         tr3 = (df_1m['low'] - prev_close).abs()

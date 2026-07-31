@@ -11,7 +11,7 @@ from smc_trader.config import (
     SHIOAJI_API_KEY, SHIOAJI_SECRET_KEY, SHIOAJI_SIMULATION,
     SWING_WINDOW_5M, SWING_WINDOW_1M, VOLUME_MA_PERIOD, VOLUME_MULT,
     DEFAULT_RR, MAX_SL_POINTS, TELEGRAM_SIGNAL_CHAT_ID, TELEGRAM_SETTLEMENT_CHAT_ID,
-    SLIPPAGE_POINTS, COMMISSION_FEE
+    SLIPPAGE_POINTS, COMMISSION_FEE, ATR_MULT
 )
 from smc_trader.smc_detector import SMCDetector
 from smc_trader.telegram_sender import send_telegram_notification
@@ -56,6 +56,7 @@ class LiveMonitor:
             swing_window_1m=SWING_WINDOW_1M,
             volume_ma_period=VOLUME_MA_PERIOD,
             volume_mult=VOLUME_MULT,
+            atr_mult=ATR_MULT,
             pullback_buffer_pts=20.0
         )
         
