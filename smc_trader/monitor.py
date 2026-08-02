@@ -601,7 +601,7 @@ class LiveMonitor:
                 if is_bullish_signal:
                     entry_price = price  # Combo #11: OB未失效即刻市價敲進
                     ob_low = last_bar['bullish_ob_low']
-                    conf_sl = last_bar['confirmed_sl_1m']
+                    conf_sl = last_bar['leg_low_1m']
                     sl1_price, sl2_price = np.nan, np.nan
                     
                     if not np.isnan(ob_low):
@@ -635,7 +635,7 @@ class LiveMonitor:
                 elif is_bearish_signal:
                     entry_price = price  # Combo #11: OB未失效即刻市價敲進
                     ob_high = last_bar['bearish_ob_high']
-                    conf_sh = last_bar['confirmed_sh_1m']
+                    conf_sh = last_bar['leg_high_1m']
                     sl1_price, sl2_price = np.nan, np.nan
                     
                     if not np.isnan(ob_high):

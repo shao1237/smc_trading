@@ -260,9 +260,13 @@ class SMCDetector:
         # 先計算 1M 在時間 t 時已確認的 Swing High/Low
         df_1m['confirmed_sh_1m'] = np.nan
         df_1m['confirmed_sl_1m'] = np.nan
+        df_1m['leg_high_1m'] = np.nan
+        df_1m['leg_low_1m'] = np.nan
         
         last_sh_1m = np.nan
         last_sl_1m = np.nan
+        leg_high_1m = np.nan
+        leg_low_1m = np.nan
         
         highs = df_1m['high'].values
         lows = df_1m['low'].values
@@ -289,11 +293,17 @@ class SMCDetector:
             if confirm_idx >= 0:
                 if is_sh_1m[confirm_idx]:
                     last_sh_1m = highs[confirm_idx]
+                    if np.isnan(leg_high_1m) or last_sh_1m > leg_high_1m:
+                        leg_high_1m = last_sh_1m
                 if is_sl_1m[confirm_idx]:
                     last_sl_1m = lows[confirm_idx]
+                    if np.isnan(leg_low_1m) or last_sl_1m < leg_low_1m:
+                        leg_low_1m = last_sl_1m
 
             df_1m.at[i, 'confirmed_sh_1m'] = last_sh_1m
             df_1m.at[i, 'confirmed_sl_1m'] = last_sl_1m
+            df_1m.at[i, 'leg_high_1m'] = leg_high_1m
+            df_1m.at[i, 'leg_low_1m'] = leg_low_1m
 
             # 2. 檢測 FVG (第 i 根，看 i-2 與 i 之間的缺口)
             # 多頭 FVG: i-2 的 High < i 的 Low
@@ -325,6 +335,10 @@ class SMCDetector:
                 df_1m.at[i, 'mss_bullish'] = True
                 sweep_low_active = False # 重設
                 
+                # 趨勢轉多：清空前一波段的極值，準備迎接新的波段
+                leg_low_1m = np.nan
+                leg_high_1m = np.nan
+                
                 # 確定 Bullish OB：在 MSS 突破前（即 sweep_low_idx 到 i 之間）最後一根陰線 (Close < Open)
                 # 若無陰線，則取該區段的最低 K 棒
                 ob_low, ob_high = np.nan, np.nan
@@ -344,6 +358,10 @@ class SMCDetector:
             if sweep_high_active and not np.isnan(last_sl_1m) and closes[i] < last_sl_1m:
                 df_1m.at[i, 'mss_bearish'] = True
                 sweep_high_active = False # 重設
+                
+                # 趨勢轉空：清空前一波段的極值，準備迎接新的波段
+                leg_low_1m = np.nan
+                leg_high_1m = np.nan
                 
                 # 確定 Bearish OB：在 MSS 突破前最後一根陽線 (Close > Open)
                 ob_low, ob_high = np.nan, np.nan
