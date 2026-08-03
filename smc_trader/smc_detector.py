@@ -300,11 +300,6 @@ class SMCDetector:
                     if np.isnan(leg_low_1m) or last_sl_1m < leg_low_1m:
                         leg_low_1m = last_sl_1m
 
-            df_1m.at[i, 'confirmed_sh_1m'] = last_sh_1m
-            df_1m.at[i, 'confirmed_sl_1m'] = last_sl_1m
-            df_1m.at[i, 'leg_high_1m'] = leg_high_1m
-            df_1m.at[i, 'leg_low_1m'] = leg_low_1m
-
             # 2. 檢測 FVG (第 i 根，看 i-2 與 i 之間的缺口)
             # 多頭 FVG: i-2 的 High < i 的 Low
             if i >= 2 and highs[i-2] < lows[i]:
@@ -322,12 +317,41 @@ class SMCDetector:
                 df_1m.at[i, 'sweep_low'] = True
                 sweep_low_active = True
                 sweep_low_idx = i
-                
+                # [FIX] 鎖定插針本身觸及的最低價(lows[i])，而不是被掃的舊參考值——
+                # 插針才是這次流動性掠奪真正探到的深度，SMC邏輯上該保護的位置
+                if np.isnan(leg_low_1m) or lows[i] < leg_low_1m:
+                    leg_low_1m = lows[i]
+
             # Sweep High: 最高點漲破已確認的 1M Swing High，但實體收盤收在 Swing High 之下
             if not np.isnan(last_sh_1m) and highs[i] > last_sh_1m and closes[i] <= last_sh_1m:
                 df_1m.at[i, 'sweep_high'] = True
                 sweep_high_active = True
                 sweep_high_idx = i
+                if np.isnan(leg_high_1m) or highs[i] > leg_high_1m:
+                    leg_high_1m = highs[i]
+
+            # 3.5 錨點失效判定：若收盤價「真的」跌破/漲破這一波追蹤的錨點（不只是插針），
+            # 不論當下是否仍在 sweep_low_active/sweep_high_active 期間，都直接作廢重置。
+            if not np.isnan(leg_low_1m) and closes[i] < leg_low_1m:
+                sweep_low_active = False
+                leg_low_1m = np.nan
+            if not np.isnan(leg_high_1m) and closes[i] > leg_high_1m:
+                sweep_high_active = False
+                leg_high_1m = np.nan
+
+            df_1m.at[i, 'confirmed_sh_1m'] = last_sh_1m
+            df_1m.at[i, 'confirmed_sl_1m'] = last_sl_1m
+            df_1m.at[i, 'leg_high_1m'] = leg_high_1m
+            df_1m.at[i, 'leg_low_1m'] = leg_low_1m
+
+            # 3.6 「乾淨突破」歸零：即使沒有正式的 sweep_low_active/sweep_high_active，
+            # 只要收盤價站上前高/跌破前低，代表這一段已經翻頁，舊的 leg 錨點對之後
+            # 全新一段沒有意義，一併歸零，避免卡住很久以前不相干的舊低/高點。
+            # （若當下正是 sweep_active，留給下面的 MSS 判斷處理，這根的欄位已經寫入，不受影響）
+            if not sweep_low_active and not np.isnan(last_sh_1m) and closes[i] > last_sh_1m:
+                leg_low_1m = np.nan
+            if not sweep_high_active and not np.isnan(last_sl_1m) and closes[i] < last_sl_1m:
+                leg_high_1m = np.nan
 
             # 4. 檢測 MSS / CHoCH (結構轉換)
             # Bullish MSS: 當 sweep_low_active 且實體收盤價突破「在此之前已確認」的 1M Swing High
@@ -335,9 +359,11 @@ class SMCDetector:
                 df_1m.at[i, 'mss_bullish'] = True
                 sweep_low_active = False # 重設
                 
-                # 趨勢轉多：清空前一波段的極值，準備迎接新的波段
+                # [FIX] 只重置多方自己的 leg_low_1m（已轉為用 OB 當主要參考）；
+                # 不要連帶重置 leg_high_1m——那是空方獨立的狀態，跟這次多方 MSS 無關。
+                # 也不覆寫本根 df_1m.at[i,'leg_low_1m']（上面已寫入正確值，monitor.py
+                # 要靠它算 SL2），只重置變數讓下一根開始才是 NaN。
                 leg_low_1m = np.nan
-                leg_high_1m = np.nan
                 
                 # 確定 Bullish OB：在 MSS 突破前（即 sweep_low_idx 到 i 之間）最後一根陰線 (Close < Open)
                 # 若無陰線，則取該區段的最低 K 棒
@@ -359,8 +385,7 @@ class SMCDetector:
                 df_1m.at[i, 'mss_bearish'] = True
                 sweep_high_active = False # 重設
                 
-                # 趨勢轉空：清空前一波段的極值，準備迎接新的波段
-                leg_low_1m = np.nan
+                # [FIX] 同上，只重置空方自己的 leg_high_1m，不連帶動到 leg_low_1m
                 leg_high_1m = np.nan
                 
                 # 確定 Bearish OB：在 MSS 突破前最後一根陽線 (Close > Open)
