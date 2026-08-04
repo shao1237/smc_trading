@@ -71,6 +71,8 @@ class LiveMonitor:
 
         # 當前模擬/實盤持倉追蹤 (二階段停利與保本管理)
         self.active_position: Optional[Dict[str, Any]] = None
+        self.closing_positions: List[Dict[str, Any]] = [] # 暫存等待平倉成交回報的部位
+
 
         # 最近一次收到 tick 的時間，供健康檢查（多久沒收到報價）使用
         self.last_tick_time: Optional[datetime.datetime] = None
@@ -245,74 +247,91 @@ class LiveMonitor:
     def _on_order_callback(self, stat: sj.OrderState, msg: dict):
         """處理 Shioaji 委託與成交回報"""
         try:
-            # [FIX] 原本寫的是 `sj.OrderState.TDeal`，但 Shioaji SDK 的 OrderState
-            # 只有 StockOrder / StockDeal / FuturesOrder / FuturesDeal 四種成員，
-            # 根本沒有 TDeal，一執行就丟 AttributeError（被下面的 except 悄悄吃掉，
-            # 只留一行 error log）。期貨成交要用 FuturesDeal，這正是
-            # 「平倉戰報那個 Telegram 群組完全沒訊息」的 root cause：
-            # 每一筆真實成交回報都在這裡失敗，_process_settlement_deal 從未被呼叫過。
             if stat == sj.OrderState.FuturesDeal:
                 action = msg.get('action')
                 price = msg.get('price')
                 qty = msg.get('quantity')
-                print()  # 換行，避免與即時報價的 \r 衝撞
+                print()
                 logger.info(f"⚡ [成交回報] Action: {action}, 價格: {price}, 口數: {qty}")
                 
-                pos = self.active_position
-                if not pos:
-                    return
+                # 若為進場單
+                if action in ["Buy", "Sell"]:
+                    pos = self.active_position
+                    if pos:
+                        is_entry = False
+                        if 'pending_trades' in pos:
+                            # 檢查是否有對應的進場單
+                            match = None
+                            for t in pos['pending_trades']:
+                                if t['purpose'] == 'entry':
+                                    match = t
+                                    break
+                            if match:
+                                is_entry = True
+                                pos['pending_trades'].remove(match)
+                        else:
+                            # 模擬模式：若無 real_entry_price 則視為進場
+                            if 'real_entry_price' not in pos:
+                                is_entry = True
+                        
+                        if is_entry and 'real_entry_price' not in pos:
+                            pos['real_entry_price'] = float(price)
+                            
+                            direction = pos.get('direction', 'UNKNOWN')
+                            dir_label = "多單市價買" if direction == "LONG" else "空單市價賣"
+                            dt_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            e_int = int(round(float(price)))
+                            sl_int = int(round(pos.get('sl', 0)))
+                            tp_int = int(round(pos.get('tp1', 0)))
+                            lots = pos.get('lots', 2)
+                            
+                            open_msg = (
+                                f"🆕 <b>[SMC 真實開倉戰報]</b>\n"
+                                f"━━━━━━━━━━━━━━━━━━\n"
+                                f"<b>成交時間</b>：{dt_str}\n"
+                                f"<b>交易方向</b>：{direction} ({dir_label})\n"
+                                f"<b>成交價格</b>：<code>{e_int}</code>\n"
+                                f"<b>設定 SL</b>：<code>{sl_int}</code>｜<b>目標 TP1</b>：<code>{tp_int}</code>\n"
+                                f"<b>持倉部位</b>：{lots} 口"
+                            )
+                            send_telegram_notification(open_msg, chat_id=TELEGRAM_SETTLEMENT_CHAT_ID)
+                            return
+
+            # 平倉成交 (可能來自 active_position 或已經移到 closing_positions 的舊部位)
+            target_pos = None
+            if self.active_position and 'pending_close' in self.active_position:
+                target_pos = self.active_position
+            else:
+                for cp in self.closing_positions:
+                    if 'pending_close' in cp:
+                        target_pos = cp
+                        break
+            
+            if target_pos:
+                close_info = target_pos['pending_close']
+                exit_price = float(price)
+                close_lots = int(qty)
                 
-                # 若為進場單，記錄真實成交均價（為簡化，直接取第一筆成交價或更新均價）
-                if 'real_entry_price' not in pos:
-                    pos['real_entry_price'] = float(price)
-                    
-                    # 發送真實開倉戰報 (因模擬/真實單皆會觸發 callback，此處為真正確立持倉的時機)
-                    direction = pos.get('direction', 'UNKNOWN')
-                    dir_label = "多單市價買" if direction == "LONG" else "空單市價賣"
-                    dt_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                    e_int = int(round(float(price)))
-                    sl_int = int(round(pos.get('sl', 0)))
-                    tp_int = int(round(pos.get('tp1', 0)))
-                    lots = pos.get('lots', 2)
-                    
-                    open_msg = (
-                        f"🆕 <b>[SMC 真實開倉戰報]</b>\n"
-                        f"━━━━━━━━━━━━━━━━━━\n"
-                        f"<b>成交時間</b>：{dt_str}\n"
-                        f"<b>交易方向</b>：{direction} ({dir_label})\n"
-                        f"<b>成交價格</b>：<code>{e_int}</code>\n"
-                        f"<b>設定 SL</b>：<code>{sl_int}</code>｜<b>目標 TP1</b>：<code>{tp_int}</code>\n"
-                        f"<b>持倉部位</b>：{lots} 口"
-                    )
-                    send_telegram_notification(open_msg, chat_id=TELEGRAM_SETTLEMENT_CHAT_ID)
+                close_info['filled_lots'] = close_info.get('filled_lots', 0) + close_lots
+                close_info['total_value'] = close_info.get('total_value', 0.0) + exit_price * close_lots
                 
-                # 若有正在等待的平倉單
-                if 'pending_close' in pos:
-                    close_info = pos['pending_close']
-                    exit_price = float(price)
-                    close_lots = int(qty)
-                    
-                    close_info['filled_lots'] = close_info.get('filled_lots', 0) + close_lots
-                    close_info['total_value'] = close_info.get('total_value', 0.0) + exit_price * close_lots
-                    
-                    # 若已全數成交
-                    if close_info['filled_lots'] >= close_info['req_lots']:
-                        avg_exit = close_info['total_value'] / close_info['filled_lots']
-                        self._process_settlement_deal(avg_exit, close_info)
-                        del pos['pending_close']
+                # 若已全數成交
+                if close_info['filled_lots'] >= close_info['req_lots']:
+                    avg_exit = close_info['total_value'] / close_info['filled_lots']
+                    self._process_settlement_deal(avg_exit, close_info, target_pos)
+                    del target_pos['pending_close']
         except Exception as e:
             logger.error(f"處理成交回報失敗: {e}")
 
-    def _process_settlement_deal(self, exit_price: float, close_info: dict):
+    def _process_settlement_deal(self, exit_price: float, close_info: dict, pos: dict):
         """處理平倉完全成交後的損益計算與 Telegram 通知"""
-        pos = self.active_position
         if not pos: return
         
         dt_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         dir_label = "多單 (LONG)" if pos['direction'] == 'LONG' else "空單 (SHORT)"
         entry_p = pos.get('real_entry_price', pos['entry_price'])
         req_lots = close_info['req_lots']
-        stage_type = close_info['stage_type'] # 'SL', 'TP1', 'FINAL', 'REVERSE'
+        stage_type = close_info['stage_type'] # 'SL', 'SL1', 'TP1', 'FINAL', 'REVERSE'
         reason = close_info['reason']
         
         net_pts, net_pnl = self._calc_pnl(entry_p, exit_price, pos['direction'], req_lots)
@@ -344,7 +363,10 @@ class LiveMonitor:
                 pos['pnl_stage1'] = pos.get('pnl_stage1', 0.0) + net_pnl
                 pos['remaining_lots'] = pos.get('lots', 2) - req_lots
             else:
-                self.active_position = None
+                if pos in self.closing_positions:
+                    self.closing_positions.remove(pos)
+                elif self.active_position == pos:
+                    self.active_position = None
             
         elif stage_type == 'TP1':
             pos['stage'] = 2
@@ -416,7 +438,6 @@ class LiveMonitor:
 
     def _process_new_tick(self, price: float, vol: int, dt: Any):
         """處理傳入的即時報價並合建成 K 線"""
-        # 確保 dt 統一轉為 datetime 物件
         if isinstance(dt, str):
             dt = pd.to_datetime(dt).to_pydatetime()
         elif hasattr(dt, 'to_pydatetime'):
@@ -424,32 +445,21 @@ class LiveMonitor:
         elif not isinstance(dt, datetime.datetime):
             dt = datetime.datetime.now()
             
-        # 去除時區屬性以利安全計算時間差
         if dt.tzinfo is not None:
             dt = dt.replace(tzinfo=None)
 
-        # 供主迴圈健康檢查使用：只要有進到這裡就代表確實收到報價
         self.last_tick_time = datetime.datetime.now()
 
-        # 過濾非交易時段的盤後試撮報價 (13:45 ~ 14:59:59 與 05:00 ~ 08:44:59)
         t = dt.time()
         if (datetime.time(13, 45) <= t < datetime.time(15, 0)) or (datetime.time(5, 0) <= t < datetime.time(8, 45)):
-            # 盤後試撮期間不處理任何 tick，避免錯誤觸發訊號或平倉
             return
 
-        # [FIX] 防止斷線重連或延遲補送時，收到「時間戳早於目前這根K棒起始時間」的
-        # 亂序 tick。若不擋掉，append 進 history_1m 後 ts 不再單調遞增，
-        # 之後 _analyze_and_print_state() 裡的 df_1m.resample(on='ts') 會直接
-        # 拋出 ValueError（而這個例外目前只在 on_tick 內被記錄、不會讓程式當掉，
-        # 但該筆之後的分析會整個失敗）。
         if self.current_bar_1m is not None and dt < self.current_bar_1m['ts']:
             logger.warning(f"⚠️ 收到時間倒退的 tick（{dt.strftime('%H:%M:%S.%f')} 早於目前 K 線 {self.current_bar_1m['ts'].strftime('%H:%M:%S.%f')}），已略過。")
             return
 
-        # 模擬模式下，1M K 線加速為 10 秒
         time_step = 10 if self.mode == "mock" else 60
         
-        # 判定是否需要換新的一根 K 線
         if self.current_bar_1m is None:
             self.current_bar_1m = {
                 'ts': dt,
@@ -462,29 +472,23 @@ class LiveMonitor:
             logger.info(f"⚡ [開始新 K 線] {dt.strftime('%H:%M:%S')} | 成交價: {C_BOLD}{price}{C_RESET} | 量: {vol}")
         else:
             cb = self.current_bar_1m
-            # 檢查時間差是否達到一個 K 線週期 (60秒或分鐘換棒)
             time_diff = (dt - cb['ts']).total_seconds()
             
-            # 若已經跨到新的一分鐘 (例如 19:32 跨到 19:33) 或滿 60 秒
             is_new_minute = (dt.minute != cb['ts'].minute) or (time_diff >= time_step)
             
             if not is_new_minute:
-                # 更新當前 K 線
                 cb['high'] = max(cb['high'], price)
                 cb['low'] = min(cb['low'], price)
                 cb['close'] = price
                 cb['volume'] += vol
-                # 印出即時報價滾動 log
                 ts_str = dt.strftime('%H:%M:%S')
                 print(f"\r⚡ [即時報價] {ts_str} | 現價: {price:.1f} | 單量: {vol} | K線 (高:{cb['high']:.1f} 低:{cb['low']:.1f})", end="", flush=True)
             else:
-                print("\n") # 換行
-                # 將當前 K 線歸檔到歷史中
+                print("\n") 
                 self.history_1m.append(cb)
                 if len(self.history_1m) > 2000:
                     self.history_1m.pop(0)
                 
-                # 開啟新的一根 K 線
                 self.current_bar_1m = {
                     'ts': dt,
                     'open': price,
@@ -494,17 +498,10 @@ class LiveMonitor:
                     'volume': vol
                 }
                 
-                # 換棒時，進行最新 SMC 特徵檢測並輸出螢幕與 Telegram！
                 self._analyze_and_print_state()
 
     def _analyze_and_print_state(self, trigger_actions: bool = True):
-        """對當前歷史 K 線數據進行 SMC 特徵辨識，並精美輸出
-
-        Args:
-            trigger_actions: 是否允許本次分析觸發持倉結算、Telegram 訊號通知與模擬下單。
-                訂閱成功後、尚未收到任何真實 tick 前的「初始結構運算」應傳入 False，
-                因為那時 history_1m 只有啟動時載入的舊快取資料，不該被當成即時訊號來源。
-        """
+        """對當前歷史 K 線數據進行 SMC 特徵辨識，並精美輸出"""
         df_1m = pd.DataFrame(self.history_1m)
         
         rule = '50s' if self.mode == "mock" else '5min'
@@ -516,23 +513,19 @@ class LiveMonitor:
             'volume': 'sum'
         }).dropna().reset_index()
 
-        # 特徵檢測
         df_5m_proc = self.detector.process_5m_structure(df_5m)
         df_1m_proc = self.detector.process_1m_signals(df_1m, df_5m_proc)
 
-        # 取得最後一根 K 線的狀態與指標
         last_bar = df_1m_proc.iloc[-1]
         ts_str = last_bar['ts'].strftime('%H:%M:%S')
         price = last_bar['close']
         trend_5m = last_bar['trend_5m']
 
-        # 即時追蹤持倉是否平倉並發送 Telegram 戰報（初始運算不觸發）
         if trigger_actions:
             self._check_position_settlement(last_bar)
 
-        # 檢測是否有特殊信號
         has_signal = False
-        signal_level = 0  # 1=Sweep, 2=MSS, 3=CISD（★ 星級）
+        signal_level = 0
         signal_tg_name = ""
         signal_str = f"{C_BOLD}無特殊信號{C_RESET}"
         
@@ -567,14 +560,12 @@ class LiveMonitor:
             has_signal = True
             signal_level = 3
 
-        # 取得當前 OB / FVG 區間
         bull_ob = f"[{last_bar['bullish_ob_low']} - {last_bar['bullish_ob_high']}]" if not np.isnan(last_bar['bullish_ob_low']) else "無"
         bear_ob = f"[{last_bar['bearish_ob_low']} - {last_bar['bearish_ob_high']}]" if not np.isnan(last_bar['bearish_ob_low']) else "無"
         
         bull_fvg = f"[{last_bar['bullish_fvg_low']} - {last_bar['bullish_fvg_high']}]" if not np.isnan(last_bar['bullish_fvg_low']) else "無"
         bear_fvg = f"[{last_bar['bearish_fvg_low']} - {last_bar['bearish_fvg_high']}]" if not np.isnan(last_bar['bearish_fvg_low']) else "無"
 
-        # 輸出格式
         trend_color = C_GREEN if trend_5m == "BULLISH" else (C_RED if trend_5m == "BEARISH" else C_RESET)
         
         logger.info(f"[{ts_str}] 價格: {C_BOLD}{price}{C_RESET} | 大結構趨勢 (5M): {trend_color}{C_BOLD}{trend_5m}{C_RESET}")
@@ -583,23 +574,19 @@ class LiveMonitor:
         logger.info(f"       多頭 FVG : {C_GREEN}{bull_fvg}{C_RESET} | 空頭 FVG : {C_RED}{bear_fvg}{C_RESET}")
         logger.info("-" * 70)
 
-        # 發送 Telegram 通知（初始運算只印出結構狀態，不觸發通知/下單）
         if has_signal and not trigger_actions:
             logger.info(f"       （初始結構運算偵測到訊號條件，但因使用舊快取資料，已略過通知與下單）")
 
         if has_signal and trigger_actions:
             dt_str = last_bar['ts'].strftime('%Y-%m-%d %H:%M:%S')
-            
-            # 動態計算交易建議與進場、停損、二階段停利價格
             is_bullish_signal = "bullish" in signal_tg_name.lower() or "sweep low" in signal_tg_name.lower() or "mss bullish" in signal_tg_name.lower() or "cisd bullish" in signal_tg_name.lower()
             is_bearish_signal = "bearish" in signal_tg_name.lower() or "sweep high" in signal_tg_name.lower() or "mss bearish" in signal_tg_name.lower() or "cisd bearish" in signal_tg_name.lower()
             
-            # 檢查過濾條件 (0.9x ATR 波動濾網)
             is_volatile = last_bar.get('is_volatile', True)
 
             if is_volatile:
                 if is_bullish_signal:
-                    entry_price = price  # Combo #11: OB未失效即刻市價敲進
+                    entry_price = price
                     ob_low = last_bar['bullish_ob_low']
                     conf_sl = last_bar['leg_low_1m']
                     sl1_price, sl2_price = np.nan, np.nan
@@ -622,9 +609,8 @@ class LiveMonitor:
                         if sl_points > MAX_SL_POINTS:
                             sl1_price = entry_price - MAX_SL_POINTS
                             sl_points = MAX_SL_POINTS
-                            sl2_price = np.nan # 放棄 SL2，因為 SL1 已經觸及最大停損極限
+                            sl2_price = np.nan
                         
-                        # TP1 @ 3.0x RR (基於 SL1 距離計算)
                         tp1_price = entry_price + sl_points * 3.0
                         
                         logger.signal(f"訊號觸發，發送 Telegram 即時監控通知 (ID: {TELEGRAM_SIGNAL_CHAT_ID}): {signal_tg_name}")
@@ -633,7 +619,7 @@ class LiveMonitor:
                         logger.info(f"       🚫 [訊號過濾] 多頭條件不足: entry_price={entry_price}, sl1_price={sl1_price}, 現價={price} (現價需大於SL)")
                         
                 elif is_bearish_signal:
-                    entry_price = price  # Combo #11: OB未失效即刻市價敲進
+                    entry_price = price
                     ob_high = last_bar['bearish_ob_high']
                     conf_sh = last_bar['leg_high_1m']
                     sl1_price, sl2_price = np.nan, np.nan
@@ -656,9 +642,8 @@ class LiveMonitor:
                         if sl_points > MAX_SL_POINTS:
                             sl1_price = entry_price + MAX_SL_POINTS
                             sl_points = MAX_SL_POINTS
-                            sl2_price = np.nan # 放棄 SL2，因為 SL1 已經觸及最大停損極限
+                            sl2_price = np.nan
                         
-                        # TP1 @ 3.0x RR 
                         tp1_price = entry_price - sl_points * 3.0
                         
                         logger.signal(f"訊號觸發，發送 Telegram 即時監控通知 (ID: {TELEGRAM_SIGNAL_CHAT_ID}): {signal_tg_name}")
@@ -671,15 +656,7 @@ class LiveMonitor:
     def _handle_signal_action(self, direction: str, signal_level: int, signal_tg_name: str,
                                entry_price: float, sl_price: float, tp1_price: float,
                                price: float, dt_str: str, trend_5m: str, sl2_price: float = None):
-        """
-        依「目前持倉狀態」與「新訊號星級」決定動作：
-        - 沒有持倉：正常開新倉（2 口 / 2 階段停利，維持原邏輯）
-        - 已有持倉，且持倉是 1★ 訊號開的、本次新訊號是 2★：允許覆蓋
-            - 同方向：加碼 1 口，套用新訊號的 SL/TP1
-            - 反方向：先以目前市價強制平倉，再反向開 1 口新倉
-        - 其他所有情況（含 3★ 想蓋 1★、任何訊號想蓋 2★/3★ 持倉）：
-          已持倉就不開新倉，Telegram 顯示「已持倉不開新倉」
-        """
+        """依持倉狀態與訊號等級進行開倉、覆蓋、或加碼"""
         pos = self.active_position
         p_int = int(round(price))
         e_int = int(round(entry_price))
@@ -687,7 +664,6 @@ class LiveMonitor:
         tp_int = int(round(tp1_price))
         dir_label = "多單市價買" if direction == "LONG" else "空單市價賣"
 
-        # 1. 無論如何，所有觸發的訊號都要純粹地推播到「訊號來源地」(SIGNAL_CHAT_ID)
         pure_signal_text = (
             f"觸發時間：{dt_str}\n"
             f"最新價格：{p_int}\n"
@@ -701,27 +677,22 @@ class LiveMonitor:
         send_telegram_notification(pure_signal_text, chat_id=TELEGRAM_SIGNAL_CHAT_ID)
 
         if pos is None:
-            # 保護機制：若現價距離掛單價太遠（例如跳空造成），為避免 Shioaji 模擬交易所 bug（會直接以市價異常成交），略過下單
-            # 此為舊版限價進場的保護，既然改為市價進場，此保護機制可暫時保留以防極端跳空，但可放寬
             if abs(price - entry_price) > 300:
                 skip_msg = f"⏸️ [極端跳空過濾] 現價 {p_int} 距離理論邊界過遠（>300點），略過本次下單。"
                 logger.info(skip_msg)
                 send_telegram_notification(skip_msg, chat_id=TELEGRAM_SETTLEMENT_CHAT_ID)
                 return
                 
-            # 目前無持倉，正常開新倉 (已在上面發送純訊號，真實成交戰報將交由 callback 處理)
             self._place_simulated_2stage_order(direction, entry_price, sl_price, tp1_price, signal_level=signal_level, lots=2, sl2_price=sl2_price)
             return
 
-        # 已有持倉：唯一允許覆蓋的組合是「目前持倉為 1★ 開倉、且本次新訊號為 2★」
-        if pos.get('signal_level') == 1 and signal_level == 2:
+        if signal_level >= 2:
             if direction == pos['direction']:
                 self._add_on_position(direction, signal_tg_name, entry_price, sl_price, tp1_price, dt_str, sl2_price)
             else:
                 self._reverse_position(direction, signal_tg_name, entry_price, sl_price, tp1_price, dt_str, price, sl2_price)
             return
 
-        # 其他所有情況：已持倉就不開新倉
         logger.info(f"⏸️ 已持倉中（{pos['direction']}／{pos.get('signal_level', '?')}★開倉），偵測到 {signal_level}★ 新訊號但不符合覆蓋條件，略過本次訊號。")
         skip_text = (
             f"觸發時間：{dt_str}\n"
@@ -733,14 +704,10 @@ class LiveMonitor:
 
     def _add_on_position(self, direction: str, signal_tg_name: str, entry_price: float,
                           sl_price: float, tp1_price: float, dt_str: str, sl2_price: float = None):
-        """2★ 訊號同方向覆蓋 1★ 持倉：加碼 1 口，套用新訊號的 SL/TP1。"""
         pos = self.active_position
         add_lots = 1
 
         if pos.get('stage') == 2:
-            # 原持倉已過 TP1、剩餘部位保本續抱中：把加碼口數併入剩餘部位，
-            # 並用新訊號的 SL/TP1 重新展開一輪停利週期（stage 重設為 1）。
-            # 先前 TP1 那筆已落袋的損益 (pnl_stage1) 予以保留，最終結算時會一併加總。
             old_lots = pos.get('remaining_lots', pos.get('lots', 2))
             pos['stage'] = 1
             pos.pop('remaining_lots', None)
@@ -765,7 +732,7 @@ class LiveMonitor:
             pos.pop('sl2', None)
         pos['sl1_hit'] = False
         pos['tp1'] = tp1_price
-        pos['signal_level'] = 2  # 持倉升級為 2★
+        pos['signal_level'] = 2
 
         sl_str = f"SL1: {sl_int} | SL2: {int(round(sl2_price))}" if sl2_price is not None and not np.isnan(sl2_price) else f"SL: {sl_int}"
         remain_note = f"下次 TP1 將平 {preview_close} 口、留 {preview_remain} 口續抱" if preview_remain > 0 else f"下次 TP1 將全部 {preview_close} 口出場"
@@ -792,9 +759,7 @@ class LiveMonitor:
                 )
                 trade = self.api.place_order(self.contract, order)
                 
-                # 記錄此加碼單，供 Callback 配對
                 if trade and trade.order:
-                    # 由於尚未取得真實均價，先將 pending_trade 放進 active_position
                     if 'pending_trades' not in pos:
                         pos['pending_trades'] = []
                     pos['pending_trades'].append({
@@ -807,7 +772,6 @@ class LiveMonitor:
             except Exception as e:
                 logger.error(f"❌ [Shioaji 加碼下單失敗]: {str(e)}")
         else:
-            # 模擬模式：直接觸發加碼成交回報
             msg = {
                 'action': 'Buy' if direction == "LONG" else 'Sell',
                 'price': entry_price,
@@ -818,35 +782,20 @@ class LiveMonitor:
 
     def _reverse_position(self, direction: str, signal_tg_name: str, entry_price: float,
                            sl_price: float, tp1_price: float, dt_str: str, price: float, sl2_price: float = None):
-        """2★ 訊號反方向覆蓋 1★ 持倉：先以目前市價強制平倉舊部位，再反向開 1 口新倉。"""
         pos = self.active_position
         lots = pos.get('remaining_lots', pos.get('lots', 2)) if pos.get('stage') == 2 else pos.get('lots', 2)
 
-        # 改用實際送單平倉，待成交後再反手
-        pos['pending_reverse_order'] = {
-            'direction': new_direction,
-            'entry_price': entry_price,
-            'sl_price': sl_price,
-            'sl2_price': sl2_price,
-            'tp1_price': tp1_price,
-        }
         self._send_close_order(lots, 'REVERSE', f"🔄 偵測到反方向 2★ 訊號（{signal_tg_name}），強制平倉反手")
+        self._place_simulated_2stage_order(direction, entry_price, sl_price, tp1_price, signal_level=2, lots=1, sl2_price=sl2_price)
 
     def _place_simulated_2stage_order(self, direction: str, entry_price: float, sl_price: float,
                                        tp1_price: float, signal_level: int = 1, lots: int = 2, sl2_price: float = None):
-        """透過 Shioaji 模擬環境自動送出限價進場與二階段分批停利委託
-
-        Args:
-            signal_level: 開倉訊號的星級（1=Sweep, 2=MSS, 3=CISD），記錄在持倉上供後續覆蓋規則判斷。
-            lots: 下單口數，預設 2 口（標準 2 階段停利模型）；反向覆蓋開倉時為 1 口。
-        """
         e_int = int(round(entry_price))
         sl_int = int(round(sl_price))
         tp_int = int(round(tp1_price))
         
         logger.info(f"🤖 [Shioaji 模擬下單觸發] 自動發起 {lots} 口小台 {direction} 委託 | 限價: {e_int}, SL: {sl_int}, TP1: {tp_int}")
         
-        # 設定即時持倉追蹤 (二階段停利)
         self.active_position = {
             'direction': direction,
             'entry_price': entry_price,
@@ -859,20 +808,14 @@ class LiveMonitor:
             'lots': lots
         }
         
-        # [FIX] 原判斷式為 `hasattr(self, 'api') and ... and self.contract is None`：
-        # self.api / self.contract 從未在別處被賦值，hasattr 永遠是 False，
-        # 且就算賦值了，`self.contract is None` 這個條件邏輯也是反的
-        # （應該是「有合約才下單」而不是「沒合約才下單」）。
-        # 這裡改為 self.api / self.contract 已在 _run_shioaji() 中綁定，
-        # 且合約存在時才真正送出委託。
         if self.api is not None and self.contract is not None:
             try:
                 act = sj.Action.Buy if direction == "LONG" else sj.Action.Sell
                 order = self.api.Order(
                     action=act,
-                    price=0, # 市價單不指定價格
-                    quantity=lots,  # 依 signal_level/覆蓋規則決定口數
-                    order_type=sj.OrderType.ROD, # 市價單(MKT) 在 Shioaji 也可以搭配 ROD
+                    price=0,
+                    quantity=lots,
+                    order_type=sj.OrderType.ROD,
                     price_type=sj.FuturesPriceType.MKT if hasattr(sj, 'FuturesPriceType') else sj.StockPriceType.MKT
                 )
                 trade = self.api.place_order(self.contract, order)
@@ -890,7 +833,6 @@ class LiveMonitor:
             except Exception as e:
                 logger.error(f"❌ [Shioaji 模擬帳戶下單失敗]: {str(e)}")
         else:
-            # 模擬模式：直接觸發進場成交回報
             msg = {
                 'action': 'Buy' if direction == "LONG" else 'Sell',
                 'price': entry_price,
@@ -900,21 +842,12 @@ class LiveMonitor:
             self._on_order_callback(sj.OrderState.FuturesDeal if hasattr(sj, 'OrderState') else 10, msg)
 
     def _calc_pnl(self, entry_price: float, exit_price: float, direction: str, lots: int) -> "tuple[float, float]":
-        """依離場價格與口數，計算扣除滑價與手續費後的淨點數與淨損益(NTD)。
-
-        [FIX] 舊版公式（`net_pts*50 - 100`）完全沒有依口數縮放，就算文字寫「2 口」，
-        算出來的錢其實只等於 1 口的損益。這裡統一改用小台每口 50 NTD 點值，
-        並依 config.py 的 SLIPPAGE_POINTS / COMMISSION_FEE（單邊）換算成來回成本，
-        正確依 `lots` 縮放。
-        """
         dir_mult = 1 if direction == 'LONG' else -1
         net_pts = (exit_price - entry_price) * dir_mult - ROUNDTRIP_SLIPPAGE_PTS
         net_pnl = net_pts * MINI_POINT_VALUE * lots - ROUNDTRIP_COMMISSION_PER_LOT * lots
         return net_pts, net_pnl
 
-    # ── 餘額暫存檔管理 ──
     def _init_balance_file(self):
-        """初始化或載入餘額暫存檔"""
         import json
         balance_file = os.path.join(os.path.dirname(__file__), "..", "data", "balance.json")
         try:
@@ -927,7 +860,6 @@ class LiveMonitor:
             logger.warning(f"初始化餘額暫存檔失敗: {e}")
 
     def _get_balance(self) -> float:
-        """讀取暫存餘額"""
         import json
         balance_file = os.path.join(os.path.dirname(__file__), "..", "data", "balance.json")
         try:
@@ -937,7 +869,6 @@ class LiveMonitor:
             return 0
 
     def _update_balance(self, pnl: float):
-        """將淨損益累加入暫存餘額"""
         import json
         balance_file = os.path.join(os.path.dirname(__file__), "..", "data", "balance.json")
         current = self._get_balance()
@@ -958,9 +889,12 @@ class LiveMonitor:
             'reason': reason
         }
         
+        if stage_type in ['SL', 'FINAL', 'REVERSE']:
+            self.closing_positions.append(pos)
+            self.active_position = None
+        
         if self.api is not None and self.contract is not None:
             try:
-                # 平倉單：多單賣出，空單買進
                 act = sj.Action.Sell if pos['direction'] == "LONG" else sj.Action.Buy
                 order = self.api.Order(
                     action=act,
