@@ -247,36 +247,38 @@ class LiveMonitor:
     def _on_order_callback(self, stat: sj.OrderState, msg: dict):
         """處理 Shioaji 委託與成交回報"""
         try:
-            if stat == sj.OrderState.FuturesDeal:
+            if stat == getattr(sj.OrderState, "FuturesDeal", None) or stat == 10:  # 10 = simulated fallback
                 action = msg.get('action')
                 price = msg.get('price')
                 qty = msg.get('quantity')
                 print()
                 logger.info(f"⚡ [成交回報] Action: {action}, 價格: {price}, 口數: {qty}")
                 
-                # 若為進場單
+                # 若為進場單或加碼單 [FIX 2026-08-05]
                 if action in ["Buy", "Sell"]:
                     pos = self.active_position
                     if pos:
-                        is_entry = False
+                        matched_purpose = None
                         if 'pending_trades' in pos:
-                            # 檢查是否有對應的進場單
-                            match = None
                             for t in pos['pending_trades']:
                                 if t['purpose'] == 'entry':
-                                    match = t
+                                    matched_purpose = 'entry'
+                                    pos['pending_trades'].remove(t)
                                     break
-                            if match:
-                                is_entry = True
-                                pos['pending_trades'].remove(match)
-                        else:
-                            # 模擬模式：若無 real_entry_price 則視為進場
+                                elif t['purpose'] == 'add_on':
+                                    matched_purpose = 'add_on'
+                                    pos['pending_trades'].remove(t)
+                                    break
+                        else: # [Mock 模擬模式]
                             if 'real_entry_price' not in pos:
-                                is_entry = True
-                        
-                        if is_entry and 'real_entry_price' not in pos:
+                                matched_purpose = 'entry'
+                            elif 'pending_close' not in pos:
+                                # 已經有建倉均價、且不是平倉單，那一定就是加碼單
+                                matched_purpose = 'add_on'
+
+                        if matched_purpose == 'entry' and 'real_entry_price' not in pos:
                             pos['real_entry_price'] = float(price)
-                            
+
                             direction = pos.get('direction', 'UNKNOWN')
                             dir_label = "多單市價買" if direction == "LONG" else "空單市價賣"
                             dt_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -284,7 +286,7 @@ class LiveMonitor:
                             sl_int = int(round(pos.get('sl', 0)))
                             tp_int = int(round(pos.get('tp1', 0)))
                             lots = pos.get('lots', 2)
-                            
+
                             open_msg = (
                                 f"🆕 <b>[SMC 真實開倉戰報]</b>\n"
                                 f"━━━━━━━━━━━━━━━━━━\n"
@@ -295,7 +297,29 @@ class LiveMonitor:
                                 f"<b>持倉部位</b>：{lots} 口"
                             )
                             send_telegram_notification(open_msg, chat_id=TELEGRAM_SETTLEMENT_CHAT_ID)
-                            return
+                            return True
+
+                        elif matched_purpose == 'add_on':
+                            direction = pos.get('direction', 'UNKNOWN')
+                            dir_label = "多單市價買" if direction == "LONG" else "空單市價賣"
+                            dt_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            e_int = int(round(float(price)))
+                            total_lots = pos.get('lots', 2)
+                            has_sl2 = pos.get('sl2') is not None and not isinstance(pos.get('sl2'), float) or (isinstance(pos.get('sl2'), float) and not math.isnan(pos.get('sl2')))
+                            sl1_val = int(round(pos.get('sl', 0)))
+                            sl_str = f"SL1: {sl1_val} | SL2: {int(round(pos.get('sl2', 0)))}" if has_sl2 else f"SL: {sl1_val}"
+                            tp_int = int(round(pos.get('tp1', 0)))
+
+                            add_msg = (
+                                f"🔼 <b>[SMC 加倉成交確認]</b>\n"
+                                f"━━━━━━━━━━━━━━━━━━\n"
+                                f"<b>成交時間</b>：{dt_str}\n"
+                                f"<b>交易方向</b>：{direction} ({dir_label})\n"
+                                f"<b>加碼成交價</b>：<code>{e_int}</code>\n"
+                                f"<b>更新後持倉</b>：{total_lots} 口 | <b>{sl_str}</b> | <b>TP1</b>: <code>{tp_int}</code>"
+                            )
+                            send_telegram_notification(add_msg, chat_id=TELEGRAM_SETTLEMENT_CHAT_ID)
+                            return False
 
             # 平倉成交 (可能來自 active_position 或已經移到 closing_positions 的舊部位)
             target_pos = None
@@ -783,10 +807,21 @@ class LiveMonitor:
     def _reverse_position(self, direction: str, signal_tg_name: str, entry_price: float,
                            sl_price: float, tp1_price: float, dt_str: str, price: float, sl2_price: float = None):
         pos = self.active_position
-        lots = pos.get('remaining_lots', pos.get('lots', 2)) if pos.get('stage') == 2 else pos.get('lots', 2)
+
+        # [FIX 2026-08-05] 準確計算目前實際持倉口數
+        # case A: stage=2（已部分平倉）→ 用 remaining_lots
+        # case B: stage=1 但已觸發 SL1→ 實際剩 remaining_lots（lots - half）
+        # case C: 一般 stage=1 → 用 lots
+        if pos.get('stage') == 2 or pos.get('sl1_hit'):
+            lots = pos.get('remaining_lots', pos.get('lots', 2) - math.ceil(pos.get('lots', 2) / 2))
+        else:
+            lots = pos.get('lots', 2)
+
+        # [FIX 2026-08-05] 新開倉的口數 = 剛才平掉的口數（維持等量）
+        reverse_lots = lots
 
         self._send_close_order(lots, 'REVERSE', f"🔄 偵測到反方向 2★ 訊號（{signal_tg_name}），強制平倉反手")
-        self._place_simulated_2stage_order(direction, entry_price, sl_price, tp1_price, signal_level=2, lots=1, sl2_price=sl2_price)
+        self._place_simulated_2stage_order(direction, entry_price, sl_price, tp1_price, signal_level=2, lots=reverse_lots, sl2_price=sl2_price)
 
     def _place_simulated_2stage_order(self, direction: str, entry_price: float, sl_price: float,
                                        tp1_price: float, signal_level: int = 1, lots: int = 2, sl2_price: float = None):
