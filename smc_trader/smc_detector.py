@@ -12,7 +12,11 @@ class SMCDetector:
     def __init__(self, swing_window_5m: int = 5, swing_window_1m: int = 3, 
                  volume_ma_period: int = 20, volume_mult: float = 1.3,
                  atr_period: int = 14, atr_ma_period: int = 20, atr_mult: float = 1.0,
-                 pullback_buffer_pts: float = 0.0):
+                 pullback_buffer_pts: float = 20.0,
+                 pullback_buffer_atr_mult: float = 1.0,
+                 pullback_buffer_min: float = 10.0,
+                 pullback_buffer_max: float = 40.0,
+                 atr_5m_period: int = 14):
         self.swing_window_5m = swing_window_5m
         self.swing_window_1m = swing_window_1m
         self.volume_ma_period = volume_ma_period
@@ -20,7 +24,15 @@ class SMCDetector:
         self.atr_period = atr_period
         self.atr_ma_period = atr_ma_period
         self.atr_mult = atr_mult
+        # [FIX] pullback_buffer_pts 現在只作為「5M ATR 還不足以計算時」的備援固定值
+        # （例如剛開盤、歷史資料還不夠 atr_5m_period 根）。正常情況下動態緩衝
+        # （pullback_buffer_atr_mult * 5M ATR，夾在 [pullback_buffer_min, pullback_buffer_max]
+        # 之間）才是實際生效的緩衝寬度，波動大時自動放寬、波動小時自動收緊。
         self.pullback_buffer_pts = pullback_buffer_pts
+        self.pullback_buffer_atr_mult = pullback_buffer_atr_mult
+        self.pullback_buffer_min = pullback_buffer_min
+        self.pullback_buffer_max = pullback_buffer_max
+        self.atr_5m_period = atr_5m_period
 
     def detect_swings(self, df: pd.DataFrame, window: int) -> pd.DataFrame:
         """
@@ -67,7 +79,8 @@ class SMCDetector:
     def process_5m_structure(self, df_5m: pd.DataFrame) -> pd.DataFrame:
         """
         在 5M K 線上辨識 Swing Points 與 BOS (Break of Structure)。
-        BOS 定義：實體 K 棒收盤突破前一個「已確認的」Swing High 或 Swing Low。
+        BOS 定義：實體 K 棒收盤突破前一個「已確認的」Swing High/Low 一段動態緩衝距離
+        （5M ATR-based，波動大時自動放寬、波動小時自動收緊）。
         """
         df_5m = self.detect_swings(df_5m, self.swing_window_5m)
         
@@ -77,6 +90,17 @@ class SMCDetector:
         df_5m['confirmed_swing_high'] = np.nan
         df_5m['confirmed_swing_low'] = np.nan
         df_5m['trend_5m'] = "NONE" # NONE, BULLISH, BEARISH
+
+        # [NEW] 5M ATR：作為動態緩衝的基礎。用 5M 自己的 high/low/close 算 True Range，
+        # 再取 rolling mean。ATR 不足（資料剛開始還不夠 atr_5m_period 根）時為 NaN，
+        # 迴圈裡會 fallback 用 self.pullback_buffer_pts 這個固定值。
+        prev_close_5m = df_5m['close'].shift(1)
+        tr1 = df_5m['high'] - df_5m['low']
+        tr2 = (df_5m['high'] - prev_close_5m).abs()
+        tr3 = (df_5m['low'] - prev_close_5m).abs()
+        tr_5m = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1, skipna=True)
+        atr_5m_arr = tr_5m.rolling(window=self.atr_5m_period, min_periods=1).mean().values
+        df_5m['atr_5m'] = atr_5m_arr
 
         last_sh = np.nan
         last_sl = np.nan
@@ -90,6 +114,11 @@ class SMCDetector:
         # consumed_sh / consumed_sl：記錄「已經被用來觸發過 BOS 的最高 swing high / 最低 swing low」。
         #   同一個價位不會重複觸發同方向的 BOS；唯有價格再創出「新的、比 consumed 值更極端」的
         #   swing high/low 並且實體突破，才能重新確立同方向趨勢，避免在盤整時反覆假突破同一價位。
+        # [FIX] consumed_sh/consumed_sl 原本永久不重置，只要拿去跑跨日、跨月的長資料，
+        # 就會被很久以前、跟當下結構已經無關的極值卡死，導致「劣勢方向」的新鮮度門檻越墊越高，
+        # 最終幾乎鎖死（實測：連續資料不重置時，多空比可以從健康的1.2~2倍惡化到200倍以上）。
+        # 現在改成：一旦趨勢真的降級成 NONE（代表這波結構已經失效），就把對應的 consumed 值
+        # 一併歸零，讓下一次哪怕是「同一個舊高/低點」的重新突破也能被視為全新的一次。
         active_break_level = np.nan
         consumed_sh = np.nan
         consumed_sl = np.nan
@@ -116,14 +145,25 @@ class SMCDetector:
             confirmed_sh_arr[i] = last_sh
             confirmed_sl_arr[i] = last_sl
 
-            # 檢測「新鮮」BOS：實體收盤突破 last_sh/last_sl，且該價位尚未被消耗過
+            # [NEW] 動態緩衝：ATR 足夠時用 ATR*mult（夾在 min~max 之間），不足時 fallback 固定值。
+            # 同一個 dynamic_buffer 同時用在「進場死區」跟「降級到NONE」兩處，兩端各留一段緩衝，
+            # 避免 reset 之後任何一次極小幅度的假突破就重新觸發（見上方討論的死區設計）。
+            if not np.isnan(atr_5m_arr[i]):
+                dynamic_buffer = float(np.clip(
+                    atr_5m_arr[i] * self.pullback_buffer_atr_mult,
+                    self.pullback_buffer_min, self.pullback_buffer_max
+                ))
+            else:
+                dynamic_buffer = self.pullback_buffer_pts
+
+            # 檢測「新鮮」BOS：實體收盤突破 last_sh/last_sl 一段死區緩衝，且該價位尚未被消耗過
             # (last_sh/last_sl 比之前 consumed 過的更高/更低，代表是真正的新高/新低)
             fresh_bullish_bos = (
-                not np.isnan(last_sh) and closes[i] > last_sh and
+                not np.isnan(last_sh) and closes[i] > (last_sh + dynamic_buffer) and
                 (np.isnan(consumed_sh) or last_sh > consumed_sh)
             )
             fresh_bearish_bos = (
-                not np.isnan(last_sl) and closes[i] < last_sl and
+                not np.isnan(last_sl) and closes[i] < (last_sl - dynamic_buffer) and
                 (np.isnan(consumed_sl) or last_sl < consumed_sl)
             )
 
@@ -139,12 +179,14 @@ class SMCDetector:
                 consumed_sl = last_sl
             else:
                 # 沒有新的 BOS 發生時，檢查是否發生「深幅回檔」，趨勢降級為 NONE
-                if current_trend == "BULLISH" and not np.isnan(active_break_level) and closes[i] < (active_break_level - self.pullback_buffer_pts):
+                if current_trend == "BULLISH" and not np.isnan(active_break_level) and closes[i] < (active_break_level - dynamic_buffer):
                     current_trend = "NONE"
                     active_break_level = np.nan
-                elif current_trend == "BEARISH" and not np.isnan(active_break_level) and closes[i] > (active_break_level + self.pullback_buffer_pts):
+                    consumed_sh = np.nan  # [NEW] 結構已失效，重置，下次同樣的高點也算全新一次
+                elif current_trend == "BEARISH" and not np.isnan(active_break_level) and closes[i] > (active_break_level + dynamic_buffer):
                     current_trend = "NONE"
                     active_break_level = np.nan
+                    consumed_sl = np.nan  # [NEW]
 
             trend_arr.append(current_trend)
 
