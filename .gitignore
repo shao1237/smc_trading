@@ -5,3 +5,6 @@ __pycache__/
 *.pyc
 .vscode/
 scratch/
+data/balance.json
+logs/
+shioaji.log

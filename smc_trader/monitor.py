@@ -433,9 +433,22 @@ class LiveMonitor:
             )
             logger.signal(f"平倉戰報 (最終): {tot_pnl:+,.0f} NTD")
             send_telegram_notification(msg, chat_id=TELEGRAM_SETTLEMENT_CHAT_ID)
-            
-            if stage_type == 'FINAL' or (stage_type == 'REVERSE' and 'pending_reverse_order' not in pos):
-                 self.active_position = None
+
+            if stage_type == 'REVERSE' and 'pending_reverse' in pos:
+                # [FIX 2026-08-06] 反手交易延遲開倉：平倉戰報已發出，
+                # 現在才送出新倉委託，保證 TG 時序「先平倉 → 後開倉」。
+                rev = pos.pop('pending_reverse')
+                if pos in self.closing_positions:
+                    self.closing_positions.remove(pos)
+                self.active_position = None
+                logger.info(f"🔄 [反手開倉] 平倉結算完成，送出 {rev['direction']} {rev['lots']} 口新倉")
+                self._place_simulated_2stage_order(
+                    rev['direction'], rev['entry_price'], rev['sl_price'],
+                    rev['tp1_price'], signal_level=rev['signal_level'],
+                    lots=rev['lots'], sl2_price=rev['sl2_price']
+                )
+            elif stage_type == 'FINAL' or (stage_type == 'REVERSE' and 'pending_reverse_order' not in pos):
+                self.active_position = None
 
     def _run_mock(self):
         """模擬實時監控"""
@@ -820,8 +833,23 @@ class LiveMonitor:
         # [FIX 2026-08-05] 新開倉的口數 = 剛才平掉的口數（維持等量）
         reverse_lots = lots
 
+        # [FIX 2026-08-06] 反手交易競態修正：只送平倉單，延遲開倉
+        # 之前 _send_close_order + _place_simulated_2stage_order 連續執行，但 Shioaji
+        # callback 異步回報不保證順序 → 新倉成交可能先到 → TG 開倉戰報比平倉先到。
+        # 修復：把新倉參數暫存到 pos['pending_reverse']，在 _process_settlement_deal
+        # 的 REVERSE 分支結算完後才開新倉，保證「平倉先 → 開倉後」。
+        pos['pending_reverse'] = {
+            'direction': direction,
+            'entry_price': entry_price,
+            'sl_price': sl_price,
+            'tp1_price': tp1_price,
+            'signal_level': 2,
+            'lots': reverse_lots,
+            'sl2_price': sl2_price,
+        }
+        logger.info(f"🔄 [反手準備] 平倉後將開 {direction} {reverse_lots} 口 | entry={int(round(entry_price))} SL={int(round(sl_price))} TP1={int(round(tp1_price))}")
+
         self._send_close_order(lots, 'REVERSE', f"🔄 偵測到反方向 2★ 訊號（{signal_tg_name}），強制平倉反手")
-        self._place_simulated_2stage_order(direction, entry_price, sl_price, tp1_price, signal_level=2, lots=reverse_lots, sl2_price=sl2_price)
 
     def _place_simulated_2stage_order(self, direction: str, entry_price: float, sl_price: float,
                                        tp1_price: float, signal_level: int = 1, lots: int = 2, sl2_price: float = None):
